@@ -1540,17 +1540,13 @@ class EnhancedGeminiIDE(tk.Tk):
             self.status_var.set(f"📊 Grading system {status}")
             self.add_chat_message("⚙️ Settings", f"Grading system {status}")
 
-    def _toggle_prompt_enhancer(self, event=None): # Keep this if settings dialog might be re-added
-        """Toggle prompt enhancer system on/off - called by settings dialog if present."""
-        if hasattr(self, 'agent_system') and hasattr(self, 'prompt_enhancer_var'): # Check if var exists
-            self.agent_system.prompt_enhancer_enabled = self.prompt_enhancer_var.get()
-            status = "enabled" if self.prompt_enhancer_var.get() else "disabled"
+    def _toggle_prompt_enhancer(self, event=None):
+        """Toggle prompt enhancer system on/off - called by the UI switch."""
+        if hasattr(self, 'agent_system'):
+            self.agent_system.prompt_enhancer_enabled = not self.agent_system.prompt_enhancer_enabled
+            status = "enabled" if self.agent_system.prompt_enhancer_enabled else "disabled"
             self.status_var.set(f"✨ Prompt Enhancer {status}")
             self.add_chat_message("⚙️ Settings", f"Prompt Enhancer agent {status}")
-            # Sync with menu var
-            # Sync with menu var (No longer applicable as menu var is removed)
-            # if hasattr(self, 'prompt_enhancer_menu_var'):
-            #     self.prompt_enhancer_menu_var.set(self.prompt_enhancer_var.get())
             self._draw_enhancer_toggle_switch() # Update visual state of the switch
 
     # def _toggle_prompt_enhancer_menu(self): # Removed as toggle is no longer in menu
