@@ -199,6 +199,7 @@ class EnhancedMultiAgentSystem:
         self.error_context = []
         self.project_context = {"files": [], "images": [], "recent_changes": []}
         self.grading_enabled = True
+        self.prompt_enhancer_enabled = True
         self.max_retry_attempts = 3
         self.current_attempt = 0
         
@@ -231,10 +232,14 @@ class EnhancedMultiAgentSystem:
             yield {"type": "error", "content": "AI system not configured. Please set API key."}
             return
 
-        # Initial prompt enhancement (occurs only once before retries)
-        yield {"type": "system", "content": "✨ Enhancing prompt..."}
-        enhanced_user_prompt = self._get_enhanced_prompt(original_user_prompt)
-        yield {"type": "agent", "agent": "✨ Prompt Enhancer", "content": enhanced_user_prompt}
+        if self.prompt_enhancer_enabled:
+            # Initial prompt enhancement (occurs only once before retries)
+            yield {"type": "system", "content": "✨ Enhancing prompt..."}
+            enhanced_user_prompt = self._get_enhanced_prompt(original_user_prompt)
+            yield {"type": "agent", "agent": "✨ Prompt Enhancer", "content": enhanced_user_prompt}
+        else:
+            enhanced_user_prompt = original_user_prompt
+            yield {"type": "system", "content": "✨ Prompt enhancer disabled. Using original prompt."}
 
         current_main_coder_prompt = enhanced_user_prompt
 
@@ -908,6 +913,7 @@ class EnhancedGeminiIDE(tk.Tk):
         agents_menu.add_command(label="🎨 Test Art Critic", command=lambda: self.test_agent("art"))
         agents_menu.add_separator()
         agents_menu.add_command(label="🔄 Reset Agent Memory", command=self.reset_agent_memory)
+        # Prompt Enhancer toggle is now a Canvas switch in the main UI, not a menu item.
         menubar.add_cascade(label="Agents", menu=agents_menu)
 
         # Settings menu
@@ -1031,25 +1037,42 @@ class EnhancedGeminiIDE(tk.Tk):
         self.input_txt.bind("<FocusIn>", self._clear_placeholder)
         self.input_txt.bind("<FocusOut>", self._restore_placeholder)
 
-        # Button frame for multiple buttons
-        button_frame = ttk.Frame(input_frame)
-        button_frame.pack(side=tk.RIGHT)
-        
-        # Screenshot upload button
-        self.screenshot_btn = ttk.Button(
-            button_frame,
-            text="📸 Upload Screenshot",
-            command=self.upload_screenshot
+        # Frame for control buttons (toggle, screenshot, send)
+        control_button_frame = ttk.Frame(input_frame)
+        control_button_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0)) # Use fill=tk.Y and anchor
+
+        # Label for the toggle switch
+        self.enhancer_toggle_label = ttk.Label(control_button_frame, text="Enhancer:")
+        self.enhancer_toggle_label.pack(side=tk.LEFT, padx=(0, 2), anchor='center')
+
+        # Custom Toggle Switch Canvas
+        self.enhancer_toggle_switch = tk.Canvas(
+            control_button_frame,
+            width=50,
+            height=22,
+            borderwidth=0, # Using 0 and drawing own border if needed
+            relief=tk.FLAT,
+            cursor="hand2"
         )
-        self.screenshot_btn.pack(side=tk.TOP, pady=(0, 5))
+        self.enhancer_toggle_switch.pack(side=tk.LEFT, padx=(0, 8), anchor='center') # Added more padding
+
+        # Screenshot upload button (now icon-only for compactness)
+        self.screenshot_btn = ttk.Button(
+            control_button_frame,
+            text="📸",
+            command=self.upload_screenshot,
+            width=3
+        )
+        self.screenshot_btn.pack(side=tk.LEFT, padx=(0, 3), anchor='center') # Adjusted padding
         
         # Enhanced send button
         self.send_btn = ttk.Button(
-            button_frame, 
-            text="🚀 Send to Agents", 
+            control_button_frame,
+            text="🚀 Send",
             command=self.send_enhanced_prompt
         )
-        self.send_btn.pack(side=tk.TOP)
+        self.send_btn.pack(side=tk.LEFT, anchor='center')
+        self.enhancer_toggle_switch.bind("<Button-1>", self._toggle_prompt_enhancer)
 
         self.editor.bind("<Control-s>", lambda e: self.save_current_file())
         self._setup_enhanced_syntax_highlighting()
@@ -1163,6 +1186,7 @@ class EnhancedGeminiIDE(tk.Tk):
             self.agent_system = EnhancedMultiAgentSystem(api_key)
             self.status_var.set("✅ Enhanced Multi-Agent System configured")
             self.add_chat_message("System", "🚀 Enhanced Multi-Agent System ready!\n\n🤖 Main Coder Agent - Vision-enabled implementation\n📊 Code Critic Agent - Deep analysis & security\n🎨 Art Critic Agent - Visual analysis & design")
+            self._draw_enhancer_toggle_switch() # Initial draw of the custom toggle switch
             self.update_agent_insights()
         except Exception as e:
             self.status_var.set(f"❌ Agent error: {str(e)}")
@@ -1467,6 +1491,15 @@ class EnhancedGeminiIDE(tk.Tk):
         )
         grading_check.pack(anchor=tk.W)
         
+        # self.prompt_enhancer_var = tk.BooleanVar(value=getattr(self.agent_system, 'prompt_enhancer_enabled', True))
+        # prompt_enhancer_check = ttk.Checkbutton(
+        #     grading_frame,
+        #     text="Enable Prompt Enhancer Agent ✨",
+        #     variable=self.prompt_enhancer_var,
+        #     command=self._toggle_prompt_enhancer
+        # )
+        # prompt_enhancer_check.pack(anchor=tk.W)
+
         ttk.Label(grading_frame, text=f"• Max Retry Attempts: {getattr(self.agent_system, 'max_retry_attempts', 3)}").pack(anchor=tk.W)
         ttk.Label(grading_frame, text="• Minimum Passing Grade: 70/100").pack(anchor=tk.W)
         
@@ -1506,6 +1539,82 @@ class EnhancedGeminiIDE(tk.Tk):
             status = "enabled" if self.grading_var.get() else "disabled"
             self.status_var.set(f"📊 Grading system {status}")
             self.add_chat_message("⚙️ Settings", f"Grading system {status}")
+
+    def _toggle_prompt_enhancer(self): # Keep this if settings dialog might be re-added
+        """Toggle prompt enhancer system on/off - called by settings dialog if present."""
+        if hasattr(self, 'agent_system') and hasattr(self, 'prompt_enhancer_var'): # Check if var exists
+            self.agent_system.prompt_enhancer_enabled = self.prompt_enhancer_var.get()
+            status = "enabled" if self.prompt_enhancer_var.get() else "disabled"
+            self.status_var.set(f"✨ Prompt Enhancer {status}")
+            self.add_chat_message("⚙️ Settings", f"Prompt Enhancer agent {status}")
+            # Sync with menu var
+            # Sync with menu var (No longer applicable as menu var is removed)
+            # if hasattr(self, 'prompt_enhancer_menu_var'):
+            #     self.prompt_enhancer_menu_var.set(self.prompt_enhancer_var.get())
+            self._draw_enhancer_toggle_switch() # Update visual state of the switch
+
+    # def _toggle_prompt_enhancer_menu(self): # Removed as toggle is no longer in menu
+    #     """Toggle prompt enhancer system on/off - called by menu."""
+    #     pass
+
+    def _draw_enhancer_toggle_switch(self):
+        """Draws the custom toggle switch based on the current state."""
+        if not hasattr(self, 'enhancer_toggle_switch') or not hasattr(self, 'agent_system'):
+            return # Not ready to draw
+
+        self.enhancer_toggle_switch.delete("all") # Clear previous drawing
+
+        # Get actual canvas dimensions as it's laid out
+        self.enhancer_toggle_switch.update_idletasks() # Ensure dimensions are up-to-date
+        width = self.enhancer_toggle_switch.winfo_width()
+        height = self.enhancer_toggle_switch.winfo_height()
+
+        if width <= 1 or height <= 1: # Canvas not yet sized by Tkinter
+             # Fallback dimensions if still not available (should not happen often with update_idletasks)
+            width = 50
+            height = 22
+            # self.enhancer_toggle_switch.after(50, self._draw_enhancer_toggle_switch)
+            # return
+
+        padding = 2
+        oval_diameter = height - 2 * padding
+
+        text_y_offset = height // 2
+
+        if self.agent_system.prompt_enhancer_enabled:
+            # Green background for "ON"
+            self.enhancer_toggle_switch.create_rectangle(
+                0, 0, width, height,
+                fill="#4CAF50", outline="#388E3C", width=1 # Darker green for border
+            )
+            # White "ON" text
+            self.enhancer_toggle_switch.create_text(
+                (width - oval_diameter - padding) / 2, text_y_offset, text="ON", fill="white",
+                font=("Segoe UI", 7, "bold"), anchor="center"
+            )
+            # Switch handle (oval) on the right
+            self.enhancer_toggle_switch.create_oval(
+                width - oval_diameter - padding, padding,
+                width - padding, height - padding,
+                fill="white", outline="#BDBDBD" # Light gray outline for handle
+            )
+        else:
+            # Red background for "OFF"
+            self.enhancer_toggle_switch.create_rectangle(
+                0, 0, width, height,
+                fill="#F44336", outline="#D32F2F", width=1 # Darker red for border
+            )
+            # White "OFF" text
+            self.enhancer_toggle_switch.create_text(
+                (width + oval_diameter + padding) / 2, text_y_offset, text="OFF", fill="white",
+                font=("Segoe UI", 7, "bold"), anchor="center"
+            )
+            # Switch handle (oval) on the left
+            self.enhancer_toggle_switch.create_oval(
+                padding, padding,
+                oval_diameter + padding, height - padding,
+                fill="white", outline="#BDBDBD" # Light gray outline for handle
+            )
 
     def analyze_selected_file(self):
         """Analyze selected file with agents"""
