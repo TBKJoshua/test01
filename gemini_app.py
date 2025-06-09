@@ -141,6 +141,33 @@ Then provide comprehensive artistic guidance including:
 Assess both aesthetic quality and functional usability. Consider accessibility, user experience, and technical implementation quality.
 """
 
+PROMPT_ENHANCER_AGENT_PROMPT = """You are a PROMPT ENHANCER AGENT. Your role is to take a user's raw prompt and transform it into a more detailed, specific, and well-structured prompt that is optimized for large language models (LLMs) and image generation models.
+
+**TASK:**
+Rewrite the given user prompt to maximize its effectiveness. Consider the following:
+1.  **Clarity and Specificity:** Add details that make the request unambiguous. For example, if the user asks for "a cat image," you might enhance it to "a photorealistic image of a fluffy ginger tabby cat lounging in a sunbeam."
+2.  **Context:** If the user's prompt is for coding, ensure the enhanced prompt specifies language, libraries, and desired functionality. For example, "python script for web server" could become "Create a Python script using the Flask framework to implement a simple web server with a single endpoint '/' that returns 'Hello, World!'."
+3.  **Structure:** Organize the prompt logically. Use bullet points or numbered lists for complex requests.
+4.  **Keywords:** Include relevant keywords that the LLM can use to generate a better response.
+5.  **Tone and Style:** Maintain the user's original intent but refine the language to be more effective for AI. For image generation, suggest artistic styles (e.g., "impressionistic style", "cyberpunk aesthetic", "shot on 35mm film").
+6.  **Completeness:** Ensure the prompt contains all necessary information for the AI to perform the task well.
+
+**RULES:**
+1.  **OUTPUT ONLY THE ENHANCED PROMPT:** Your response must ONLY contain the enhanced prompt text. Do not include any explanations, apologies, or conversational filler.
+2.  **MAINTAIN INTENT:** Do not change the core meaning or goal of the user's original request.
+3.  **BE CONCISE BUT THOROUGH:** The enhanced prompt should be detailed but not overly verbose.
+
+**EXAMPLE (Image Generation):**
+User Prompt: "dog playing"
+Enhanced Prompt: "A high-resolution digital painting of a golden retriever puppy playfully chasing a red ball across a sunlit grassy field, with a shallow depth of field effect. Art style: Disney Pixar."
+
+**EXAMPLE (Code Generation):**
+User Prompt: "make a button in html"
+Enhanced Prompt: "Create an HTML snippet for a button with the text 'Click Me'. The button should have a blue background, white text, rounded corners (border-radius: 5px), and a subtle box-shadow. When clicked, it should execute a JavaScript function called 'handleButtonClick()'."
+
+Now, enhance the following user prompt:
+"""
+
 def load_api_key():
     """Load API key from environment or config file"""
     if "GEMINI_API_KEY" in os.environ:
@@ -183,11 +210,33 @@ class EnhancedMultiAgentSystem:
             "generate_image": self.generate_image,
         }
 
-    def run_enhanced_interaction(self, user_prompt):
+    def _get_enhanced_prompt(self, user_prompt):
+        """Calls the PROMPT_ENHANCER_AGENT to refine the user's prompt."""
+        try:
+            prompt_parts = [{"text": f"{PROMPT_ENHANCER_AGENT_PROMPT}\n\n{user_prompt}"}]
+            enhanced_response = self.client.models.generate_content(
+                model=TEXT_MODEL_NAME,
+                contents=prompt_parts
+            )
+            self._log_interaction("prompt_enhancer", enhanced_response.text)
+            return enhanced_response.text
+        except Exception as e:
+            self.error_context.append(f"Prompt Enhancer Error: {e}")
+            # Fallback to original prompt if enhancer fails
+            return user_prompt
+
+    def run_enhanced_interaction(self, original_user_prompt):
         """Enhanced multi-agent interaction with grading and retry system"""
         if not self.client:
             yield {"type": "error", "content": "AI system not configured. Please set API key."}
             return
+
+        # Initial prompt enhancement (occurs only once before retries)
+        yield {"type": "system", "content": "✨ Enhancing prompt..."}
+        enhanced_user_prompt = self._get_enhanced_prompt(original_user_prompt)
+        yield {"type": "agent", "agent": "✨ Prompt Enhancer", "content": enhanced_user_prompt}
+
+        current_main_coder_prompt = enhanced_user_prompt
 
         # Reset attempt counter for new interactions
         self.current_attempt = 0
@@ -202,7 +251,7 @@ class EnhancedMultiAgentSystem:
             # Phase 1: Main Coder Agent Analysis and Implementation
             yield {"type": "system", "content": f"🚀 Main Coder Agent analyzing and implementing...{attempt_suffix}"}
             
-            main_prompt_parts = self._build_enhanced_prompt(user_prompt, MAIN_AGENT_PROMPT)
+            main_prompt_parts = self._build_enhanced_prompt(current_main_coder_prompt, MAIN_AGENT_PROMPT)
             
             try:
                 main_response = self.client.models.generate_content(
@@ -210,7 +259,7 @@ class EnhancedMultiAgentSystem:
                     contents=main_prompt_parts
                 )
                 
-                self._log_interaction("user", user_prompt)
+                self._log_interaction("user", current_main_coder_prompt) # Log the prompt sent to main coder
                 self._log_interaction("main_coder", main_response.text)
                 
                 yield {"type": "agent", "agent": "🤖 Main Coder", "content": main_response.text}
@@ -222,8 +271,9 @@ class EnhancedMultiAgentSystem:
                     yield result
 
                 # Phase 2: Smart Agent Selection with Grading
-                should_use_critic = self._should_invoke_code_critic(user_prompt, main_response.text, implementation_results)
-                should_use_art_critic = self._should_invoke_art_critic(user_prompt, main_response.text, implementation_results)
+                # Critics should see the original prompt to understand the user's raw request
+                should_use_critic = self._should_invoke_code_critic(original_user_prompt, main_response.text, implementation_results)
+                should_use_art_critic = self._should_invoke_art_critic(original_user_prompt, main_response.text, implementation_results)
                 
                 critic_grade = None
                 art_grade = None
@@ -231,7 +281,7 @@ class EnhancedMultiAgentSystem:
                 if should_use_critic and self.grading_enabled:
                     yield {"type": "system", "content": "🔍 Code Critic Agent performing deep analysis and grading..."}
                     
-                    critic_analysis = self._get_code_critique(user_prompt, main_response.text, implementation_results)
+                    critic_analysis = self._get_code_critique(original_user_prompt, main_response.text, implementation_results)
                     if critic_analysis:
                         yield {"type": "agent", "agent": "📊 Code Critic", "content": critic_analysis}
                         critic_grade = self._extract_grade(critic_analysis)
@@ -239,7 +289,7 @@ class EnhancedMultiAgentSystem:
                 if should_use_art_critic and self.grading_enabled:
                     yield {"type": "system", "content": "🎨 Art Critic Agent analyzing visual elements and grading..."}
                     
-                    art_analysis = self._get_art_critique(user_prompt, main_response.text, implementation_results)
+                    art_analysis = self._get_art_critique(original_user_prompt, main_response.text, implementation_results)
                     if art_analysis:
                         yield {"type": "agent", "agent": "🎭 Art Critic", "content": art_analysis}
                         art_grade = self._extract_grade(art_analysis)
@@ -251,7 +301,8 @@ class EnhancedMultiAgentSystem:
                     
                     if overall_grade < 70 and self.current_attempt < self.max_retry_attempts:
                         yield {"type": "system", "content": f"⚠️ Grade below 70. Requesting Main Coder to improve... (Attempt {self.current_attempt + 1}/{self.max_retry_attempts})"}
-                        user_prompt = f"RETRY: {user_prompt}\n\nPREVIOUS ATTEMPT FEEDBACK:\nCode Critic Grade: {critic_grade or 'N/A'}\nArt Critic Grade: {art_grade or 'N/A'}\nOverall Grade: {overall_grade}/100\n\nPlease improve the implementation based on the critique feedback above."
+                        retry_intro = f"RETRY (Original User Prompt: '{original_user_prompt}'):\n\nPREVIOUS ATTEMPT FEEDBACK:\nCode Critic Grade: {critic_grade or 'N/A'}\nArt Critic Grade: {art_grade or 'N/A'}\nOverall Grade: {overall_grade}/100\n\nPlease improve the implementation based on the critique feedback above."
+                        current_main_coder_prompt = f"{retry_intro}\n\n{enhanced_user_prompt}"
                         continue  # Retry with improved prompt
                     elif overall_grade >= 70:
                         yield {"type": "system", "content": f"✅ Grade acceptable ({overall_grade}/100). Implementation approved!"}
@@ -1193,8 +1244,9 @@ class EnhancedGeminiIDE(tk.Tk):
                     agent_name = msg["agent"]
                     agent_colors = {
                         "🤖 Main Coder": "#2E8B57",
-                        "📊 Code Critic": "#FF6347", 
+                        "📊 Code Critic": "#FF6347",
                         "🎭 Art Critic": "#9370DB",
+                        "✨ Prompt Enhancer": "#FFD700", # Gold color for enhancer
                         "🤝 Collaborative": "#4169E1"
                     }
                     color = agent_colors.get(agent_name, "#000000")
@@ -1308,7 +1360,9 @@ class EnhancedGeminiIDE(tk.Tk):
         timestamp = time.strftime("[%H:%M:%S] ")
         
         # Configure tags
-        sender_tag = f"sender_{sender.replace(' ', '_').replace('🤖', '').replace('📊', '').replace('🎭', '').strip()}"
+        # Use regex to create a safe tag name from the sender string
+        safe_sender_name = re.sub(r'\W+', '', sender) # Remove non-alphanumeric
+        sender_tag = f"sender_{safe_sender_name.strip()}"
         self.chat.tag_configure(sender_tag, foreground=color, font=("Segoe UI", 11, "bold"))
         self.chat.tag_configure("timestamp", foreground="gray", font=("Segoe UI", 9))
         self.chat.tag_configure("message", font=("Segoe UI", 11))
@@ -1841,8 +1895,9 @@ class EnhancedGeminiIDE(tk.Tk):
                     agent_name = msg["agent"]
                     agent_colors = {
                         "🤖 Main Coder": "#2E8B57",
-                        "📊 Code Critic": "#FF6347", 
+                        "📊 Code Critic": "#FF6347",
                         "🎭 Art Critic": "#9370DB",
+                        "✨ Prompt Enhancer": "#FFD700", # Gold color for enhancer
                         "🤝 Collaborative": "#4169E1"
                     }
                     color = agent_colors.get(agent_name, "#000000")
