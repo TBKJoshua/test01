@@ -141,7 +141,7 @@ Then provide comprehensive artistic guidance including:
 Assess both aesthetic quality and functional usability. Consider accessibility, user experience, and technical implementation quality.
 """
 
-PROMPT_ENHANCER_AGENT_PROMPT = """You are a PROMPT ENHANCER AGENT. Your role is to take a user's raw prompt and transform it into a more detailed, specific, and well-structured prompt that is optimized for large language models (LLMs) and image generation models.
+PROMPT_ENHANCER_AGENT_PROMPT = """You are a PROMPT ENHANCER AGENT. Your role is to take a user's raw prompt and transform it into a more detailed, specific, and well-structured prompt that is optimized for large language models (LLMs) and image generation models. Your *sole* responsibility is to refine and rephrase the user's input to be a better prompt for a different AI. You do not answer or execute any part of the user's request.
 
 **TASK:**
 Rewrite the given user prompt to maximize its effectiveness. Consider the following:
@@ -153,9 +153,10 @@ Rewrite the given user prompt to maximize its effectiveness. Consider the follow
 6.  **Completeness:** Ensure the prompt contains all necessary information for the AI to perform the task well.
 
 **RULES:**
-1.  **OUTPUT ONLY THE ENHANCED PROMPT:** Your response must ONLY contain the enhanced prompt text. Do not include any explanations, apologies, or conversational filler.
+1.  **CRITICALLY IMPORTANT: OUTPUT ONLY THE ENHANCED PROMPT:** Your response *must exclusively* contain the refined prompt text and nothing else. Do not include any explanations, apologies, conversational filler, or any attempt to answer or execute the user's underlying request. Your job is *only* to improve the prompt for another AI.
 2.  **MAINTAIN INTENT:** Do not change the core meaning or goal of the user's original request.
 3.  **BE CONCISE BUT THOROUGH:** The enhanced prompt should be detailed but not overly verbose.
+4.  **DO NOT ANSWER:** Under no circumstances should you attempt to answer or fulfill the request described in the user's prompt. Your only task is to make the prompt itself better for a subsequent AI agent.
 
 **EXAMPLE (Image Generation):**
 User Prompt: "dog playing"
@@ -1540,17 +1541,13 @@ class EnhancedGeminiIDE(tk.Tk):
             self.status_var.set(f"📊 Grading system {status}")
             self.add_chat_message("⚙️ Settings", f"Grading system {status}")
 
-    def _toggle_prompt_enhancer(self): # Keep this if settings dialog might be re-added
-        """Toggle prompt enhancer system on/off - called by settings dialog if present."""
-        if hasattr(self, 'agent_system') and hasattr(self, 'prompt_enhancer_var'): # Check if var exists
-            self.agent_system.prompt_enhancer_enabled = self.prompt_enhancer_var.get()
-            status = "enabled" if self.prompt_enhancer_var.get() else "disabled"
+    def _toggle_prompt_enhancer(self, event=None):
+        """Toggle prompt enhancer system on/off - called by the UI switch."""
+        if hasattr(self, 'agent_system'):
+            self.agent_system.prompt_enhancer_enabled = not self.agent_system.prompt_enhancer_enabled
+            status = "enabled" if self.agent_system.prompt_enhancer_enabled else "disabled"
             self.status_var.set(f"✨ Prompt Enhancer {status}")
             self.add_chat_message("⚙️ Settings", f"Prompt Enhancer agent {status}")
-            # Sync with menu var
-            # Sync with menu var (No longer applicable as menu var is removed)
-            # if hasattr(self, 'prompt_enhancer_menu_var'):
-            #     self.prompt_enhancer_menu_var.set(self.prompt_enhancer_var.get())
             self._draw_enhancer_toggle_switch() # Update visual state of the switch
 
     # def _toggle_prompt_enhancer_menu(self): # Removed as toggle is no longer in menu
