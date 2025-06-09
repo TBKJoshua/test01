@@ -1540,7 +1540,7 @@ class EnhancedGeminiIDE(tk.Tk):
             self.status_var.set(f"📊 Grading system {status}")
             self.add_chat_message("⚙️ Settings", f"Grading system {status}")
 
-    def _toggle_prompt_enhancer(self): # Keep this if settings dialog might be re-added
+    def _toggle_prompt_enhancer(self, event=None): # Keep this if settings dialog might be re-added
         """Toggle prompt enhancer system on/off - called by settings dialog if present."""
         if hasattr(self, 'agent_system') and hasattr(self, 'prompt_enhancer_var'): # Check if var exists
             self.agent_system.prompt_enhancer_enabled = self.prompt_enhancer_var.get()
