@@ -267,7 +267,7 @@ class EnhancedMultiAgentSystem:
     def _handle_proactive_art_guidance(self, enhanced_user_prompt):
         """Handles the proactive art guidance phase."""
         proactive_art_advice = None
-        if self._should_invoke_art_critic(enhanced_user_prompt, "", []):
+        if self._should_invoke_art_critic(enhanced_user_prompt, "", [], mode="proactive"):
             yield {"type": "system", "content": "🎨 Art Critic providing initial guidance..."}
             yield {"type": "agent_status_update", "agent": "art_critic_proactive", "status": "active"}
             try:
@@ -328,6 +328,7 @@ class EnhancedMultiAgentSystem:
         final_art_grade_for_overall_calc = None
 
         should_use_critic = self._should_invoke_code_critic(original_user_prompt, main_response_text, implementation_results)
+        # Reactive call, defaults to mode="reactive"
         should_use_art_critic = self._should_invoke_art_critic(original_user_prompt, main_response_text, implementation_results)
 
         if should_use_critic and self.grading_enabled:
@@ -819,38 +820,60 @@ Focus on actionable improvements that leverage all three agent perspectives.
         
         return has_code_work and has_file_changes
 
-    def _should_invoke_art_critic(self, user_prompt, main_response, implementation_results):
-        """Smart detection for when Art Critic is actually needed"""
-        # Skip for simple operational commands
+    def _should_invoke_art_critic(self, user_prompt, main_response, implementation_results, mode="reactive"):
+        """Smart detection for when Art Critic is actually needed, with proactive/reactive modes."""
+        prompt_lower = user_prompt.lower()
+
+        if mode == "proactive":
+            proactive_visual_keywords = [
+                'generate image', 'create image', 'make image', 'draw image',
+                'generate logo', 'create logo', 'design logo',
+                'generate banner', 'create banner', 'design banner',
+                'generate icon', 'create icon', 'design icon',
+                'generate picture', 'create picture',
+                'new art for', 'visual asset for', 'generate art for'
+            ]
+            if any(keyword in prompt_lower for keyword in proactive_visual_keywords):
+                return True
+            return False
+
+        # Reactive mode (default)
+        # Skip for simple operational commands if not explicitly about visuals
         simple_commands = [
             'run', 'start', 'execute', 'launch', 'install', 'update', 'serve'
         ]
-        prompt_lower = user_prompt.lower()
-        if any(cmd in prompt_lower and len(prompt_lower.split()) <= 4 for cmd in simple_commands):
-            return False
-        
-        # Only invoke for visual/design work
-        visual_work_indicators = [
-            'generate_image', 'create image', 'design', 'visual', 'ui', 'interface',
-            'color', 'layout', 'style', 'aesthetic', 'art', 'graphic', 'icon',
-            'logo', 'banner', 'picture', 'photo'
-        ]
-        
-        text_to_check = f"{user_prompt} {main_response}".lower()
-        has_visual_work = any(indicator in text_to_check for indicator in visual_work_indicators)
-        
-        # Check if images were actually generated/modified
-        has_image_changes = any(result.get("type") == "file_changed" and 
-                               result.get("content", "").lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
-                               for result in implementation_results)
-        
-        # Check if this is specifically about visual analysis
+        # Check for explicit visual analysis first, as this should always trigger reactive
         explicit_visual_analysis = any(phrase in prompt_lower for phrase in [
             'analyze image', 'review design', 'visual feedback', 'art critique',
             'design review', 'improve visuals'
         ])
+        if explicit_visual_analysis:
+            return True
+
+        # If not explicit analysis, then check if it's a simple command that isn't visual
+        if any(cmd in prompt_lower and len(prompt_lower.split()) <= 4 for cmd in simple_commands):
+            # Check if even simple commands might be visual (e.g. "run image generation")
+            # This is a bit broad, but tries to catch simple visual commands.
+            if not any(vis_cmd in prompt_lower for vis_cmd in ['image', 'visual', 'art', 'design', 'graphic']):
+                return False # It's a simple, non-visual command
+
+        # Broader visual work indicators for reactive mode
+        visual_work_indicators = [
+            'generate_image', 'create image', 'design', 'visual', 'ui', 'interface',
+            'color', 'layout', 'style', 'aesthetic', 'art', 'graphic', 'icon',
+            'logo', 'banner', 'picture', 'photo'
+            # 'analyze image', 'review design' etc. are covered by explicit_visual_analysis now
+        ]
         
-        return has_visual_work or has_image_changes or explicit_visual_analysis
+        text_to_check = f"{user_prompt} {main_response}".lower() # main_response can be empty for proactive
+        has_visual_work = any(indicator in text_to_check for indicator in visual_work_indicators)
+        
+        # Check if images were actually generated/modified (only relevant for reactive)
+        has_image_changes = any(result.get("type") == "file_changed" and 
+                               result.get("content", "").lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))
+                               for result in implementation_results)
+        
+        return has_visual_work or has_image_changes # explicit_visual_analysis already returned True if matched
 
     def _needs_refinement(self, implementation_results):
         """Determine if refinement is needed based on results"""
@@ -2491,13 +2514,13 @@ class EnhancedGeminiIDE(tk.Tk):
                     self.add_chat_message("🔧 System", msg["content"], color=self.system_chat_color) # Use defined system color
                 elif msg["type"] == "error":
                     error_content = msg.get("content", "An unspecified error occurred.")
-                    self.add_chat_message("❌ Error", error_content, color=self.error_chat_color) # Use defined error color
+                    self.add_chat_message("❌ Error", error_content, color=self.error_chat_color)
                     # Set agent icons to error color
                     self.main_status.config(foreground=self.agent_status_error_color)
                     self.critic_status.config(foreground=self.agent_status_error_color)
                     self.art_status.config(foreground=self.agent_status_error_color)
                     error_summary = str(error_content).split('\n')[0]
-                    self.status_var.set(f"❌ Error: {error_summary[:100]}")
+                    self.status_var.set(f"❌ Error: {error_summary[:100]}") # Update status bar text
                 elif msg["type"] == "agent_status_update":
                     agent_name = msg["agent"]
                     status = msg["status"]
@@ -2509,7 +2532,7 @@ class EnhancedGeminiIDE(tk.Tk):
                         "art_critic_proactive": "🎨 Art Critic (Proactive)",
                         "prompt_enhancer": "✨ Prompt Enhancer"
                     }
-                    display_name = agent_display_names.get(agent_name, agent_name) # Fallback to raw name
+                    display_name = agent_display_names.get(agent_name, agent_name)
 
                     target_widget = None
                     if agent_name == "main_coder":
@@ -2519,7 +2542,7 @@ class EnhancedGeminiIDE(tk.Tk):
                     elif agent_name == "art_critic" or agent_name == "art_critic_proactive":
                         target_widget = self.art_status
                     elif agent_name == "prompt_enhancer":
-                        target_widget = self.main_status # Prompt enhancer affects main coder flow
+                        target_widget = self.main_status
 
                     if target_widget:
                         if status == "active":
@@ -2529,8 +2552,11 @@ class EnhancedGeminiIDE(tk.Tk):
                             target_widget.config(foreground=self.agent_status_inactive_color)
                             # Set a generic processing message if the system isn't fully done or in an error state.
                             # This helps bridge the gap between one agent finishing and another starting, or before the final "done" message.
-                            if not (self.status_var.get().startswith("✅") or self.status_var.get().startswith("❌")):
-                                self.status_var.set("🔄 Enhanced Multi-Agent System processing...")
+                            # Only update to generic "processing..." if a specific agent is not currently active.
+                            # This check is imperfect as it doesn't know the state of *other* agents,
+                            # but it's better than always overwriting an active agent's status.
+                            if f"{display_name} processing..." == self.status_var.get():
+                                 self.status_var.set("🔄 Enhanced Multi-Agent System processing...")
                 elif msg["type"] == "screenshot_success":
                     filename = msg["content"]
                     self._finalize_screenshot_processing(filename)
