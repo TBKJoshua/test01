@@ -1,6 +1,5 @@
 
 import os
-import sys
 import threading
 import queue
 import subprocess
@@ -8,10 +7,12 @@ import ast
 import configparser
 import time
 import re
-import base64
+import shutil
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, scrolledtext
 from pathlib import Path
+
+# Third-party imports
 from PIL import Image, ImageTk
 
 # pip install google-genai Pillow
@@ -151,6 +152,10 @@ Rewrite the given user prompt to maximize its effectiveness. Consider the follow
 4.  **Keywords:** Include relevant keywords that the LLM can use to generate a better response.
 5.  **Tone and Style:** Maintain the user's original intent but refine the language to be more effective for AI. For image generation, suggest artistic styles (e.g., "impressionistic style", "cyberpunk aesthetic", "shot on 35mm film").
 6.  **Completeness:** Ensure the prompt contains all necessary information for the AI to perform the task well.
+7.  **Self-Improvement/Meta-Modification Requests:** If the user's prompt is a request for the AI system to improve itself, its own code (e.g., the Python code of this application), or its capabilities, reformulate this into an actionable prompt for a *coding agent*. This enhanced prompt should direct the coding agent to:
+    a. Analyze its current codebase (which it should have access to, particularly files like `gemini_app.py` if mentioned or implied).
+    b. Identify specific areas for improvement based on the user's request (e.g., refactoring for efficiency, adding a new feature, improving error handling, enhancing comments or documentation).
+    c. Implement these improvements by generating commands to modify its own code files. Ensure the prompt specifies which files to modify if known.
 
 **RULES:**
 1.  **CRITICALLY IMPORTANT: OUTPUT ONLY THE ENHANCED PROMPT:** Your response *must exclusively* contain the refined prompt text and nothing else. Do not include any explanations, apologies, conversational filler, or any attempt to answer or execute the user's underlying request. Your job is *only* to improve the prompt for another AI.
@@ -561,51 +566,95 @@ Focus on actionable improvements that leverage all three agent perspectives.
         return False
 
     def _process_enhanced_commands(self, response_text):
-        """Enhanced command processing with better error handling"""
-        command_pattern = re.compile(r'`(.*?)`', re.DOTALL)
+        """Enhanced command processing with a more specific regex, pre-checks, and detailed error logging."""
+        # Regex to find function-like calls: command_name(arguments)
+        # It looks for a valid identifier, followed by '(', any characters (non-greedy), and then ')'
+        # Allows for optional whitespace around the command itself within the backticks.
+        command_pattern = re.compile(r'`\s*([a-zA-Z_][\w\.]*\s*\(.*?\))\s*`', re.DOTALL)
         matches = command_pattern.finditer(response_text)
 
         for match in matches:
-            command_str = match.group(1).strip()
+            command_str = match.group(1).strip() # command_str is now the pure command like "create_file(...)"
+
             if not command_str:
                 continue
 
+            # Pre-check if the command string starts with a known command handler name followed by an opening parenthesis
+            # This helps filter out malformed or unintended matches before attempting ast.parse
+            if not any(command_str.startswith(known_cmd + "(") for known_cmd in self.command_handlers.keys()):
+                # Optionally log this as a skipped potential command if debugging is needed
+                # self.error_context.append(f"Skipped potential command (unknown prefix): '{command_str[:50]}...'")
+                yield {"type": "system", "content": f"ℹ️ Note: Ignoring potential command-like text: `{command_str[:100]}{'...' if len(command_str) > 100 else ''}`"}
+                continue
+
             try:
+                # Attempt to parse the command string as a Python expression (specifically, a function call)
                 parsed_expr = ast.parse(command_str, mode="eval")
                 call_node = parsed_expr.body
                 
+                # Ensure it's a Call node (function call)
                 if not isinstance(call_node, ast.Call):
+                    # This should ideally be caught by the regex, but as a safeguard:
+                    self.error_context.append(f"Command parsing error: Not a function call - '{command_str}'")
+                    yield {"type": "error", "content": f"❌ Command error: Not a function call - `{command_str}`"}
                     continue
 
                 func_name = call_node.func.id
                 if func_name not in self.command_handlers:
-                    yield {"type": "error", "content": f"Unknown command: {func_name}"}
+                    self.error_context.append(f"Unknown command: '{func_name}' in '{command_str}'")
+                    yield {"type": "error", "content": f"❌ Unknown command: `{func_name}`"}
                     continue
 
-                args = [ast.literal_eval(arg) for arg in call_node.args]
-                result = self.command_handlers[func_name](*args)
+                # Safely evaluate arguments
+                args = []
+                for arg_node in call_node.args:
+                    try:
+                        args.append(ast.literal_eval(arg_node))
+                    except ValueError as ve:
+                        # Handle cases where an argument is not a simple literal (e.g., a variable or complex expression)
+                        # For now, we'll log and skip this command as it's not supported by literal_eval
+                        error_msg = f"Command argument error: Non-literal argument in '{command_str}'. Argument: {ast.dump(arg_node)}. Error: {ve}"
+                        self.error_context.append(error_msg)
+                        yield {"type": "error", "content": f"❌ Command error: Invalid argument in `{command_str}`"}
+                        break  # Break from processing args for this command
+                else: # This 'else' belongs to the for loop, executed if the loop completed without a 'break'
+                    result = self.command_handlers[func_name](*args)
 
-                if func_name == "generate_image":
-                    for update in result:
-                        yield update
-                else:
-                    yield {"type": "system", "content": result}
-                    
-                # Track successful changes
-                if func_name in ["create_file", "write_to_file", "generate_image"]:
-                    self.project_context["recent_changes"].append({
-                        "command": func_name,
-                        "args": args,
-                        "timestamp": time.time()
-                    })
+                    if func_name == "generate_image":
+                        for update in result: # generate_image is a generator
+                            yield update
+                    else:
+                        yield {"type": "system", "content": result}
 
-            except Exception as e:
-                error_msg = f"Command execution error: '{command_str}' - {e}"
+                    # Track successful changes
+                    if func_name in ["create_file", "write_to_file", "generate_image"]:
+                        self.project_context["recent_changes"].append({
+                            "command": func_name,
+                            "args": args, # Log sanitized args
+                            "timestamp": time.time()
+                        })
+                    continue # Move to the next matched command
+
+                # If the for loop for args was broken (due to bad arg), skip to next command match
+                if args and isinstance(args[-1], Exception): # Check if loop was broken by an error
+                     continue
+
+
+            except SyntaxError as se:
+                error_msg = f"Command syntax error: Unable to parse '{command_str}'. Error: {se}"
                 self.error_context.append(error_msg)
-                yield {"type": "error", "content": error_msg}
+                yield {"type": "error", "content": f"❌ Command syntax error: `{command_str}`"}
+            except ValueError as ve: # Catches errors from ast.literal_eval if the whole command_str was somehow evaluated
+                error_msg = f"Command value error: Problem with argument values in '{command_str}'. Error: {ve}"
+                self.error_context.append(error_msg)
+                yield {"type": "error", "content": f"❌ Command value error: `{command_str}`"}
+            except Exception as e: # General catch-all for other unexpected errors
+                error_msg = f"Unexpected command execution error for '{command_str}'. Error: {type(e).__name__} - {e}"
+                self.error_context.append(error_msg)
+                yield {"type": "error", "content": f"❌ Unexpected error processing command: `{command_str}`"}
 
     def _log_interaction(self, role, content):
-        """Log interaction for conversation history"""
+        """Logs an interaction to the conversation history, maintaining a manageable length."""
         self.conversation_history.append({
             "role": role,
             "content": content,
@@ -617,7 +666,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
             self.conversation_history = self.conversation_history[-15:]
 
     def _format_results(self, results):
-        """Format implementation results for agent review"""
+        """Formats a list of implementation results for inclusion in agent prompts."""
         if not results:
             return "No implementation results"
         
@@ -627,7 +676,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
         return "\n".join(formatted)
 
     def _get_project_summary(self):
-        """Get concise project summary"""
+        """Gets a concise summary of the current project state (file counts)."""
         file_count = len(self.project_context.get("files", []))
         image_count = len(self.project_context.get("images", []))
         recent_changes = len(self.project_context.get("recent_changes", []))
@@ -635,7 +684,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
         return f"Files: {file_count}, Images: {image_count}, Recent changes: {recent_changes}"
 
     def _get_recent_conversation_summary(self):
-        """Get summary of recent conversation"""
+        """Gets a summary of the most recent part of the conversation history."""
         if not self.conversation_history:
             return "No recent conversation"
         
@@ -680,13 +729,13 @@ Focus on actionable improvements that leverage all three agent perspectives.
             return None
             
         # Look for "GRADE: XX/100" pattern
-        import re
         grade_match = re.search(r'GRADE:\s*(\d+)/100', agent_response, re.IGNORECASE)
         if grade_match:
             return int(grade_match.group(1))
         
         # Fallback: look for standalone numbers near "grade"
-        grade_match = re.search(r'grade[:\s]*(\d+)', agent_response, re.IGNORECASE)
+        # Prefer 1-3 digits, whole word matching for "grade" and the number
+        grade_match = re.search(r'\bgrade[:\s]*(\d{1,3})\b', agent_response, re.IGNORECASE)
         if grade_match:
             return int(grade_match.group(1))
             
@@ -700,10 +749,37 @@ Focus on actionable improvements that leverage all three agent perspectives.
         return sum(grades) // len(grades)  # Average of available grades
 
     def _safe_path(self, filename):
-        """Sanitize file paths"""
-        if not filename or ".." in filename.split(os.path.sep):
+        """Sanitize file paths to ensure they are within VM_DIR and prevent traversal."""
+        if not filename: # Disallow empty filenames
             return None
-        return VM_DIR / filename
+
+        # Prevent absolute paths in the provided filename argument
+        if Path(filename).is_absolute():
+            return None
+
+        # Combine with VM_DIR and then normalize
+        # os.path.abspath will normalize the path (e.g., remove '..') and make it absolute.
+        # This helps in comparing it reliably against the VM_DIR's absolute path.
+        # It's crucial that VM_DIR is an absolute path for this comparison or that both are treated consistently.
+        # Since VM_DIR is Path('vm'), it's relative to the execution directory.
+
+        abs_vm_dir = os.path.abspath(VM_DIR)
+
+        # Construct the full path
+        full_path = VM_DIR / filename
+        abs_full_path = os.path.abspath(full_path)
+
+        # Check if the normalized full path starts with the normalized VM_DIR path
+        if os.path.commonprefix([abs_full_path, abs_vm_dir]) != abs_vm_dir:
+            return None # Path is outside VM_DIR or filename tries to escape
+
+        # Additionally, ensure that the resolved path doesn't escape via symlinks
+        # This is harder to do perfectly without actually resolving, which might fail for create_file.
+        # The commonprefix check on abspath is a good primary defense.
+        # For now, we rely on the abspath check. A more advanced check might involve Path.resolve()
+        # but would need careful handling if the path doesn't exist yet.
+
+        return full_path # Return the Path object, still relative to execution if VM_DIR is
 
     def _create_file(self, path, content=""):
         """Create new file with enhanced error handling"""
@@ -747,18 +823,9 @@ Focus on actionable improvements that leverage all three agent perspectives.
 
         try:
             if filepath.is_dir():
-                # Enhanced directory deletion
-                file_count = sum(1 for _ in filepath.rglob('*') if _.is_file())
-                for p in reversed(list(filepath.rglob('*'))):
-                    if p.is_file():
-                        p.unlink()
-                    elif p.is_dir():
-                        try:
-                            p.rmdir()
-                        except OSError:
-                            pass
-                filepath.rmdir()
-                return f"✅ Deleted directory: {path} ({file_count} files)"
+                # Use shutil.rmtree for robust recursive directory deletion
+                shutil.rmtree(filepath)
+                return f"✅ Deleted directory: {path}"
             else:
                 file_size = filepath.stat().st_size
                 filepath.unlink()
@@ -775,10 +842,17 @@ Focus on actionable improvements that leverage all three agent perspectives.
 
         try:
             start_time = time.time()
+            # SECURITY CRITICAL: shell=True is dangerous with untrusted input.
+            # Use shell=False and split the command using shlex for safety.
+            import shlex
+            cmd_parts = shlex.split(command)
+            if not cmd_parts: # Handle empty command after shlex split
+                return "❌ Empty command provided"
+
             proc = subprocess.run(
-                command,
+                cmd_parts, # Pass as a list
                 cwd=VM_DIR,
-                shell=True,
+                shell=False, # Set to False for security
                 capture_output=True,
                 text=True,
                 timeout=120  # Increased timeout
@@ -1122,17 +1196,17 @@ class EnhancedGeminiIDE(tk.Tk):
         self._save_timer = self.after(2000, self._auto_save)
 
     def _auto_save(self):
-        """Auto-save current file"""
+        """Auto-save current file if one is open."""
         if self.current_open_file_path:
             self.save_current_file()
 
     def _clear_placeholder(self, event):
-        """Clear placeholder text"""
+        """Clears the placeholder text from the input field on focus."""
         if self.input_txt.get("1.0", tk.END).strip().startswith("💬 Ask the multi-agent"):
             self.input_txt.delete("1.0", tk.END)
 
     def _restore_placeholder(self, event):
-        """Restore placeholder if empty"""
+        """Restores placeholder text to the input field if it's empty on focus out."""
         if not self.input_txt.get("1.0", tk.END).strip():
             self.input_txt.insert("1.0", "💬 Ask the multi-agent system anything... (Ctrl+Enter to send)")
 
@@ -1235,6 +1309,7 @@ class EnhancedGeminiIDE(tk.Tk):
 
         self.input_txt.config(state="disabled")
         self.send_btn.config(state="disabled")
+        self.screenshot_btn.config(state="disabled") # Disable screenshot button during processing
         self.status_var.set("🔄 Enhanced Multi-Agent System Processing...")
 
         # Update agent status to processing
@@ -1291,6 +1366,7 @@ class EnhancedGeminiIDE(tk.Tk):
                 elif msg["type"] == "done":
                     self.input_txt.config(state="normal")
                     self.send_btn.config(state="normal")
+                    self.screenshot_btn.config(state="normal") # Re-enable screenshot button
                     self.status_var.set("✅ Enhanced Multi-Agent System Ready")
                     # Reset agent status
                     self.main_status.config(foreground="green")
@@ -1688,6 +1764,11 @@ class EnhancedGeminiIDE(tk.Tk):
             line_count = len(content.splitlines())
             char_count = len(content)
             self.status_var.set(f"📝 Loaded: {path.name} ({line_count} lines, {char_count} chars)")
+        except UnicodeDecodeError:
+            self.editor.delete("1.0", tk.END)
+            self.editor.insert("1.0", "❌ Error reading file: File is not valid UTF-8 text.")
+            self.status_var.set("❌ File error: Not a UTF-8 text file.")
+            self.current_open_file_path = None
         except Exception as e:
             self.editor.delete("1.0", tk.END)
             self.editor.insert("1.0", f"❌ Error reading file: {str(e)}")
@@ -1719,7 +1800,11 @@ class EnhancedGeminiIDE(tk.Tk):
             "Enter file name (relative to project):\nTip: Include extension (.py, .js, .html, etc.)"
         )
         if file_name:
-            file_path = self.agent_system._safe_path(file_name) if hasattr(self, 'agent_system') else VM_DIR / file_name
+            if not hasattr(self, 'agent_system') or self.agent_system is None:
+                messagebox.showerror("❌ Agent System Error", "Agent system not available. Cannot ensure safe path for new file.")
+                return # Stop if agent system for _safe_path is not available
+
+            file_path = self.agent_system._safe_path(file_name)
             if file_path:
                 try:
                     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1771,17 +1856,10 @@ class EnhancedGeminiIDE(tk.Tk):
         if messagebox.askyesno("🗑️ Confirm Deletion", f"Delete '{path_to_delete}'?\n\nThis action cannot be undone."):
             try:
                 if full_path_to_delete.is_dir():
-                    file_count = sum(1 for _ in full_path_to_delete.rglob('*') if _.is_file())
-                    for p in reversed(list(full_path_to_delete.rglob('*'))):
-                        if p.is_file():
-                            p.unlink()
-                        elif p.is_dir():
-                            try:
-                                p.rmdir()
-                            except OSError:
-                                pass
-                    full_path_to_delete.rmdir()
-                    self.status_var.set(f"✅ Deleted directory: {path_to_delete} ({file_count} files)")
+                    # shutil.rmtree is used for robust recursive directory deletion (already applied in a previous step)
+                    # The file_count logic associated with the manual rmtree is no longer needed.
+                    shutil.rmtree(full_path_to_delete) # Assuming this line was the intended state from previous step
+                    self.status_var.set(f"✅ Deleted directory: {path_to_delete}")
                 else:
                     file_size = full_path_to_delete.stat().st_size
                     full_path_to_delete.unlink()
@@ -1812,7 +1890,6 @@ class EnhancedGeminiIDE(tk.Tk):
     def upload_screenshot(self):
         """Automatic screenshot capture and insertion"""
         try:
-            import tempfile
             import subprocess
             import time
             import threading
@@ -1852,10 +1929,8 @@ class EnhancedGeminiIDE(tk.Tk):
     def _auto_capture_screenshot(self):
         """Automatically capture screenshot and save to project"""
         try:
-            import tempfile
             import subprocess
             import time
-            import io
             from PIL import ImageGrab
             
             # Method 1: Try using PIL ImageGrab with clipboard after snipping tool
