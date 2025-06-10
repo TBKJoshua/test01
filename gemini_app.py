@@ -28,6 +28,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 CONFIG_PATH = Path('config.ini')
 VM_DIR = Path('vm')
+TRASH_DIR_NAME = ".trash" # For storing discarded images
 APP_TITLE = "Enhanced Multi-Agent IDE"
 TEXT_MODEL_NAME = "gemini-2.5-flash-preview-05-20"
 IMAGE_MODEL_NAME = "gemini-2.0-flash-preview-image-generation"
@@ -60,6 +61,7 @@ You operate in a headless environment with full vision capabilities. You can ana
 5. **VISUAL AWARENESS**: Consider existing images when making implementation decisions.
 6. **COLLABORATION**: Work with Code Critic and Art Critic for optimal results.
 7. **QUALITY EXCELLENCE**: Aim for high-quality implementation as critique agents will grade your work.
+8. **IMAGE GENERATION VARIATIONS**: When tasked with generating an image, you MUST generate three distinct variations. For each variation, issue a separate `generate_image(path, prompt)` command. Use unique, descriptive filenames (e.g., `image_v1.png`, `image_v2.png`, `image_v3.png`). If possible, subtly vary the prompts for each of the three images to encourage diversity, while adhering to the core user request and any artistic guidance provided.
 
 **INTERACTION FLOW:**
 1. Implement user requests through commands with highest quality standards
@@ -140,6 +142,23 @@ Then provide comprehensive artistic guidance including:
 
 **GRADING CRITERIA:**
 Assess both aesthetic quality and functional usability. Consider accessibility, user experience, and technical implementation quality.
+"""
+
+PROACTIVE_ART_AGENT_PROMPT = """You are the ART CRITIQUE AGENT, acting in a PROACTIVE GUIDANCE role.
+Your task is to help the Main Coder Agent generate a high-quality image by providing artistic direction *before* generation.
+Analyze the following user request and provide:
+1.  **Suggested Art Style(s):** (e.g., photorealistic, impressionistic, anime, cyberpunk)
+2.  **Mood and Tone:** (e.g., serene, energetic, mysterious, whimsical)
+3.  **Key Visual Elements:** (e.g., dominant subjects, important background features)
+4.  **Color Palette Suggestions:** (e.g., warm tones, monochrome, vibrant contrasting colors, specific hex codes if applicable)
+5.  **Compositional Ideas:** (e.g., rule of thirds, leading lines, specific camera angles)
+6.  **Keywords for Image Generation:** (A list of potent keywords)
+7.  **Optimized Image Generation Prompt for Coder:** (A complete, detailed prompt the Main Coder can use)
+
+USER REQUEST:
+{{USER_REQUEST}}
+
+Provide your guidance clearly and concisely. Do not grade.
 """
 
 PROMPT_ENHANCER_AGENT_PROMPT = """You are a PROMPT ENHANCER AGENT. Your role is to take a user's raw prompt and transform it into a more detailed, specific, and well-structured prompt that is optimized for large language models (LLMs) and image generation models. Your *sole* responsibility is to refine and rephrase the user's input to be a better prompt for a different AI. You do not answer or execute any part of the user's request.
@@ -247,6 +266,26 @@ class EnhancedMultiAgentSystem:
             enhanced_user_prompt = original_user_prompt
             yield {"type": "system", "content": "✨ Prompt enhancer disabled. Using original prompt."}
 
+        proactive_art_advice = None
+        # Check if proactive art guidance is needed
+        if self._should_invoke_art_critic(enhanced_user_prompt, "", []): # Pass empty values for main_response and implementation_results
+            yield {"type": "system", "content": "🎨 Art Critic providing initial guidance..."}
+            # Assume _get_proactive_art_guidance exists and will be implemented later
+            # For now, this call might error if the method is not defined.
+            # We are only adding the placeholder and structure.
+            try:
+                # This method is not yet implemented, so we'll wrap it in a try-except
+                # and proceed if it's not found, as per subtask instructions.
+                if hasattr(self, "_get_proactive_art_guidance"):
+                    proactive_art_advice = self._get_proactive_art_guidance(enhanced_user_prompt)
+                    if proactive_art_advice:
+                        yield {"type": "agent", "agent": "🎨 Art Critic (Proactive)", "content": proactive_art_advice}
+                else:
+                    yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented."}
+            except AttributeError:
+                 yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented (AttributeError)."}
+
+
         current_main_coder_prompt = enhanced_user_prompt
 
         # Reset attempt counter for new interactions
@@ -262,7 +301,13 @@ class EnhancedMultiAgentSystem:
             # Phase 1: Main Coder Agent Analysis and Implementation
             yield {"type": "system", "content": f"🚀 Main Coder Agent analyzing and implementing...{attempt_suffix}"}
             
-            main_prompt_parts = self._build_enhanced_prompt(current_main_coder_prompt, MAIN_AGENT_PROMPT)
+            # Pass proactive_art_advice to _build_enhanced_prompt
+            # Assuming _build_enhanced_prompt will be updated to accept this
+            main_prompt_parts = self._build_enhanced_prompt(
+                current_main_coder_prompt,
+                MAIN_AGENT_PROMPT,
+                proactive_art_advice=proactive_art_advice # Pass as new keyword argument
+            )
             
             try:
                 main_response = self.client.models.generate_content(
@@ -274,12 +319,28 @@ class EnhancedMultiAgentSystem:
                 self._log_interaction("main_coder", main_response.text)
                 
                 yield {"type": "agent", "agent": "🤖 Main Coder", "content": main_response.text}
+
+                # Check for multiple image generation commands
+                if main_response.text.count("`generate_image(") >= 2:
+                    yield {"type": "system", "content": "ℹ️ Main Coder is generating multiple image variations..."}
                 
                 # Execute commands and track changes
                 implementation_results = []
+                generated_image_paths_batch = [] # Initialize list here
+
                 for result in self._process_enhanced_commands(main_response.text):
                     implementation_results.append(result)
-                    yield result
+                    yield result # continue yielding all results for logging/UI updates
+
+                    # Check if this result is a generated image file path
+                    if result.get("type") == "file_changed":
+                        file_path_str = result.get("content", "")
+                        # Basic check for image extensions
+                        if file_path_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                            # Further check if it's likely from our VM_DIR, though generate_image should ensure this.
+                            # This is a basic check; more robust validation could be added if needed.
+                            if Path(file_path_str).parent.name == VM_DIR.name or Path(file_path_str).parent.parent.name == VM_DIR.name :
+                                generated_image_paths_batch.append(file_path_str)
 
                 # Phase 2: Smart Agent Selection with Grading
                 # Critics should see the original prompt to understand the user's raw request
@@ -287,38 +348,191 @@ class EnhancedMultiAgentSystem:
                 should_use_art_critic = self._should_invoke_art_critic(original_user_prompt, main_response.text, implementation_results)
                 
                 critic_grade = None
-                art_grade = None
+                # art_grade = None # Replaced by individual grades in all_art_critiques
+                all_art_critiques = []
                 
                 if should_use_critic and self.grading_enabled:
                     yield {"type": "system", "content": "🔍 Code Critic Agent performing deep analysis and grading..."}
-                    
                     critic_analysis = self._get_code_critique(original_user_prompt, main_response.text, implementation_results)
                     if critic_analysis:
                         yield {"type": "agent", "agent": "📊 Code Critic", "content": critic_analysis}
                         critic_grade = self._extract_grade(critic_analysis)
 
-                if should_use_art_critic and self.grading_enabled:
-                    yield {"type": "system", "content": "🎨 Art Critic Agent analyzing visual elements and grading..."}
+                # Check if art critic should be invoked for any generated images
+                if self.grading_enabled and generated_image_paths_batch: # If images were generated and grading is on
+                    # This message is shown once before the loop if there are images to critique
+                    yield {"type": "system", "content": "🎨 Art Critic Agent analyzing generated visual elements and grading (batch)..."}
                     
-                    art_analysis = self._get_art_critique(original_user_prompt, main_response.text, implementation_results)
-                    if art_analysis:
-                        yield {"type": "agent", "agent": "🎭 Art Critic", "content": art_analysis}
-                        art_grade = self._extract_grade(art_analysis)
+                    for i, image_path in enumerate(generated_image_paths_batch):
+                        # Ensure image_path is a string and not a Path object for os.path.basename
+                        image_filename = os.path.basename(str(image_path))
+                        yield {"type": "system", "content": f"🎨 Art Critic evaluating image: {image_filename} ({i+1}/{len(generated_image_paths_batch)})..."}
+                        art_analysis_single = self._get_art_critique(
+                            original_user_prompt,
+                            main_response.text,
+                            implementation_results,
+                            target_image_path=str(image_path) # Ensure it's a string
+                        )
+                        if art_analysis_single:
+                            current_art_grade = self._extract_grade(art_analysis_single)
+                            critique_entry = {
+                                "image_path": str(image_path),
+                                "critique_text": art_analysis_single,
+                                "grade": current_art_grade
+                            }
+                            all_art_critiques.append(critique_entry)
+                            yield {
+                                "type": "agent",
+                                "agent": f"🎭 Art Critic ({image_filename})",
+                                "content": art_analysis_single
+                            }
+                elif should_use_art_critic and self.grading_enabled: # Case where art critic was requested but no images were batch generated (e.g. analyze existing image)
+                    yield {"type": "system", "content": "🎨 Art Critic Agent analyzing visual elements (general)..."}
+                    art_analysis_general = self._get_art_critique(original_user_prompt, main_response.text, implementation_results, target_image_path=None)
+                    if art_analysis_general:
+                        current_art_grade_general = self._extract_grade(art_analysis_general)
+                        # Store it in a way that the later logic can find an art grade
+                        all_art_critiques.append({
+                            "image_path": "general_critique", # Placeholder path
+                            "critique_text": art_analysis_general,
+                            "grade": current_art_grade_general
+                        })
+                        yield {"type": "agent", "agent": "🎭 Art Critic", "content": art_analysis_general}
+
 
                 # Phase 3: Grade Evaluation and Retry Decision
-                if self.grading_enabled and (critic_grade is not None or art_grade is not None):
-                    overall_grade = self._calculate_overall_grade(critic_grade, art_grade)
-                    yield {"type": "system", "content": f"📊 Overall Grade: {overall_grade}/100"}
+
+                best_image_details = None
+                highest_art_grade = -1 # Assuming grades are 0-100
+
+                if all_art_critiques:
+                    for critique_item in all_art_critiques:
+                        current_grade = critique_item.get('grade')
+                        if current_grade is not None and current_grade > highest_art_grade:
+                            highest_art_grade = current_grade
+                            best_image_details = critique_item
                     
-                    if overall_grade < 70 and self.current_attempt < self.max_retry_attempts:
-                        yield {"type": "system", "content": f"⚠️ Grade below 70. Requesting Main Coder to improve... (Attempt {self.current_attempt + 1}/{self.max_retry_attempts})"}
-                        retry_intro = f"RETRY (Original User Prompt: '{original_user_prompt}'):\n\nPREVIOUS ATTEMPT FEEDBACK:\nCode Critic Grade: {critic_grade or 'N/A'}\nArt Critic Grade: {art_grade or 'N/A'}\nOverall Grade: {overall_grade}/100\n\nPlease improve the implementation based on the critique feedback above."
-                        current_main_coder_prompt = f"{retry_intro}\n\n{enhanced_user_prompt}"
-                        continue  # Retry with improved prompt
-                    elif overall_grade >= 70:
-                        yield {"type": "system", "content": f"✅ Grade acceptable ({overall_grade}/100). Implementation approved!"}
+                    if best_image_details:
+                        yield {"type": "system", "content": f"🏆 Selected '{os.path.basename(best_image_details['image_path'])}' as the best image with a grade of {best_image_details['grade']}/100."}
+                        final_art_grade_for_overall_calc = best_image_details['grade']
                     else:
-                        yield {"type": "system", "content": f"⚠️ Maximum attempts reached. Final grade: {overall_grade}/100"}
+                        yield {"type": "system", "content": "ℹ️ No best image could be determined from the batch (no valid grades)."}
+                        final_art_grade_for_overall_calc = None # Or a default low score if preferred
+                else:
+                    # No art critiques were performed (e.g., non-image task, or art critic was skipped)
+                    final_art_grade_for_overall_calc = None
+                    if generated_image_paths_batch: # Images were generated but not critiqued
+                        yield {"type": "system", "content": "ℹ️ Images were generated but not graded by Art Critic."}
+                    # If no images were generated, no message specific to best image selection is needed here.
+
+                perform_retry = False
+                retry_reason_message = ""
+                art_grade_display = final_art_grade_for_overall_calc if final_art_grade_for_overall_calc is not None else "N/A" # For display
+                overall_grade = self._calculate_overall_grade(critic_grade, final_art_grade_for_overall_calc)
+
+
+                if self.grading_enabled and generated_image_paths_batch and any(cq.get('grade') is not None for cq in all_art_critiques):
+                    # Image generation was attempted and at least one image was graded
+                    # Check if ALL generated images in the batch failed
+                    # This assumes all_art_critiques only contains items from the current generated_image_paths_batch if generated_image_paths_batch is not empty
+                    num_graded_batch_images = 0
+                    failing_batch_images_count = 0
+                    for critique_item in all_art_critiques:
+                        if critique_item.get('image_path') in generated_image_paths_batch and critique_item.get('grade') is not None:
+                            num_graded_batch_images +=1
+                            if critique_item.get('grade') < 70:
+                                failing_batch_images_count +=1
+
+                    if num_graded_batch_images > 0 and num_graded_batch_images == failing_batch_images_count:
+                        perform_retry = True
+                        retry_reason_message = "⚠️ None of the generated images met the passing grade (all < 70/100)."
+
+                if not perform_retry and self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None):
+                    # Fallback to overall grade if not an image batch retry or if image batch passed but code failed
+                    if overall_grade < 70:
+                        perform_retry = True
+                        retry_reason_message = f"⚠️ Overall grade ({overall_grade}/100) is below 70."
+
+                # Yield current overall grade before retry decision
+                if self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None):
+                     yield {"type": "system", "content": f"📊 Overall Grade: {overall_grade}/100 (Code: {critic_grade or 'N/A'}, Art: {art_grade_display})"}
+
+
+                if perform_retry and self.current_attempt < self.max_retry_attempts:
+                    yield {"type": "system", "content": f"{retry_reason_message} Requesting Main Coder to improve... (Attempt {self.current_attempt + 1}/{self.max_retry_attempts})"}
+
+                    art_critique_summary_for_retry = "No specific art critiques available for this attempt.\n"
+                    if all_art_critiques:
+                        art_critique_summary_for_retry = "Summary of Art Critiques (focus on best image if applicable):\n"
+                        if best_image_details: # best_image_details would have the highest grade
+                            art_critique_summary_for_retry += (f"Best Image ({os.path.basename(best_image_details['image_path'])}, "
+                                                               f"Grade: {best_image_details['grade'] or 'N/A'}):\n"
+                                                               f"{best_image_details['critique_text'][:400]}...\n\n")
+                        # Add summaries of other images if they also failed, or refer to chat.
+                        other_failing_critiques = [c for c in all_art_critiques if c.get('grade', 0) < 70 and c != best_image_details]
+                        if other_failing_critiques:
+                            art_critique_summary_for_retry += "Other critiques for images needing improvement:\n"
+                            for c_item in other_failing_critiques[:2]: # Limit to avoid overly long prompts
+                                art_critique_summary_for_retry += f"- {os.path.basename(c_item['image_path'])} (Grade: {c_item['grade']}): {c_item['critique_text'][:200]}...\n"
+                        elif len(all_art_critiques) > 1 and best_image_details and best_image_details.get('grade', 0) >=70 :
+                             art_critique_summary_for_retry += "The best image was acceptable, but other aspects of the request or code may need improvement if overall grade is low.\n"
+                        elif not best_image_details and all_art_critiques:
+                            art_critique_summary_for_retry = "Multiple art critiques provided. Please review them in the chat history.\n"
+
+
+                    retry_intro = (f"RETRY (Original User Prompt: '{original_user_prompt}'):\n\n"
+                                   f"PREVIOUS ATTEMPT FEEDBACK:\n"
+                                   f"Code Critic Grade: {critic_grade or 'N/A'}\n"
+                                   f"Art Critic Best Image Grade: {art_grade_display}\n"
+                                   f"Overall Grade: {overall_grade}/100\n"
+                                   f"{retry_reason_message}\n\n"
+                                   f"Please improve the implementation based on the critique feedback above. "
+                                   f"Focus on addressing issues in both code and image generation (if applicable).\n\n"
+                                   f"Art Critiques Summary:\n{art_critique_summary_for_retry.strip()}")
+                    current_main_coder_prompt = f"{retry_intro}\n\n{enhanced_user_prompt}"
+                    continue  # Retry with improved prompt
+
+                elif perform_retry: # Max attempts reached
+                    yield {"type": "system", "content": f"⚠️ Maximum attempts reached. {retry_reason_message} Final overall grade: {overall_grade}/100"}
+
+                elif self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None) and overall_grade >=70: # Explicitly check for passing overall grade
+                    yield {"type": "system", "content": f"✅ Grade acceptable ({overall_grade}/100). Implementation approved!"}
+
+                elif not self.grading_enabled: # If grading is disabled, and we didn't hit an error or other retry.
+                     yield {"type": "system", "content": "✅ Processing complete (grading disabled)."}
+
+                # --- Loser Image Handling ---
+                paths_to_trash_this_attempt = []
+                if generated_image_paths_batch:
+                    best_image_path_final = best_image_details.get('image_path') if best_image_details else None
+                    best_image_grade_final = best_image_details.get('grade', -1) if best_image_details else -1
+
+                    if perform_retry: # Current attempt is being discarded, trash ALL generated images for this attempt
+                        paths_to_trash_this_attempt.extend(generated_image_paths_batch)
+                        yield {"type": "system", "content": f"🗑️ Discarding all {len(generated_image_paths_batch)} images from this attempt due to retry."}
+                    else: # This is the final attempt for this interaction (either success or max retries reached)
+                        if best_image_path_final and best_image_grade_final >= 70:
+                            # A best image was selected and it passed
+                            for img_path in generated_image_paths_batch:
+                                if img_path != best_image_path_final:
+                                    paths_to_trash_this_attempt.append(img_path)
+                            if paths_to_trash_this_attempt:
+                                yield {"type": "system", "content": f"🗑️ Keeping best image '{os.path.basename(best_image_path_final)}'. Trashing {len(paths_to_trash_this_attempt)} other variants."}
+                        else:
+                            # No best image passed, or no best image was selected on this final attempt
+                            paths_to_trash_this_attempt.extend(generated_image_paths_batch)
+                            if generated_image_paths_batch: # Only message if there were images
+                                yield {"type": "system", "content": f"🗑️ No single best image met criteria on final attempt. Trashing all {len(generated_image_paths_batch)} generated images."}
+
+                if paths_to_trash_this_attempt:
+                    unique_paths_to_trash = list(set(paths_to_trash_this_attempt))
+                    if unique_paths_to_trash: # Ensure there's something to trash after unique
+                        trash_path_display = Path(VM_DIR) / TRASH_DIR_NAME
+                        yield {"type": "system", "content": f"ℹ️ Moving {len(unique_paths_to_trash)} non-selected/failed image(s) to the '{trash_path_display}' folder..."}
+                        move_log_messages = self._move_to_trash(unique_paths_to_trash)
+                        for log_msg in move_log_messages:
+                            yield {"type": "system", "content": log_msg}
+                # --- End Loser Image Handling ---
 
                 # Phase 4: Collaborative Refinement (only if agents were involved and refinement needed)
                 if (should_use_critic or should_use_art_critic) and self._needs_refinement(implementation_results):
@@ -361,17 +575,35 @@ Please provide a comprehensive code review focusing on quality, security, perfor
             self.error_context.append(f"Code Critic Error: {e}")
             return None
 
-    def _get_art_critique(self, user_prompt, main_response, implementation_results):
-        """Get enhanced art critique with vision capabilities"""
-        art_context_parts = self._build_visual_context(f"""
+    def _get_art_critique(self, user_prompt, main_response, implementation_results, target_image_path=None):
+        """Get enhanced art critique with vision capabilities, focusing on a target image if provided."""
+        critique_focus_text = ""
+        if target_image_path:
+            # Make target_image_path relative to VM_DIR for display in the prompt if it's not already
+            try:
+                rel_target_image_path = Path(target_image_path).relative_to(VM_DIR)
+            except ValueError:
+                rel_target_image_path = target_image_path # Keep as is if not relative to VM_DIR
+
+            critique_focus_text = f"""
+YOU ARE CRITIQUING THIS SPECIFIC IMAGE: {rel_target_image_path}
+
+Please analyze THIS SPECIFIC IMAGE ({rel_target_image_path}) for visual elements, design guidance, and suggest improvements.
+All other images in the VISUAL CONTEXT section below are for reference or comparison if needed.
+"""
+
+        art_context_text = f"""
 ORIGINAL REQUEST: {user_prompt}
 
-MAIN CODER IMPLEMENTATION: {main_response}
+MAIN CODER IMPLEMENTATION (may include multiple image generation commands):
+{main_response}
 
-IMPLEMENTATION RESULTS: {self._format_results(implementation_results)}
-
+IMPLEMENTATION RESULTS (shows files created, including possibly multiple images):
+{self._format_results(implementation_results)}
+{critique_focus_text}
 Please analyze visual elements, provide design guidance, and suggest improvements for better aesthetics and user experience.
-""", ART_AGENT_PROMPT)
+"""
+        art_context_parts = self._build_visual_context(art_context_text, ART_AGENT_PROMPT)
         
         try:
             response = self.client.models.generate_content(
@@ -383,6 +615,77 @@ Please analyze visual elements, provide design guidance, and suggest improvement
         except Exception as e:
             self.error_context.append(f"Art Critic Error: {e}")
             return None
+
+    def _get_proactive_art_guidance(self, current_user_prompt):
+        """Get proactive art guidance before image generation."""
+        try:
+            # Prepare the prompt for the Art Critic
+            # The context_text here is primarily the user's request for the new image.
+            context_text = f"USER REQUEST FOR NEW IMAGE:\n{current_user_prompt}"
+
+            # Use _build_visual_context to also provide existing images for context.
+            # The system_prompt for _build_visual_context will be the PROACTIVE_ART_AGENT_PROMPT
+            # with the user request placeholder filled.
+            formatted_proactive_prompt = PROACTIVE_ART_AGENT_PROMPT.replace("{{USER_REQUEST}}", current_user_prompt)
+
+            proactive_art_context_parts = self._build_visual_context(
+                context_text=context_text, # This provides the user request within the visual context section
+                system_prompt=formatted_proactive_prompt # This is the main system prompt for the agent
+            )
+
+            response = self.client.models.generate_content(
+                model=TEXT_MODEL_NAME,
+                contents=proactive_art_context_parts
+            )
+            self._log_interaction("proactive_art_critic", response.text)
+            return response.text
+        except Exception as e:
+            self.error_context.append(f"Proactive Art Critic Error: {e}")
+            return None
+
+    def _move_to_trash(self, image_paths_to_move):
+        """Moves specified image paths to the .trash directory within VM_DIR."""
+        messages = []
+        # Ensure TRASH_DIR_NAME is defined, e.g. as a global or class constant if not already.
+        # For this implementation, assuming TRASH_DIR_NAME is accessible.
+        # The trash directory should be inside VM_DIR.
+        trash_dir = VM_DIR / TRASH_DIR_NAME
+        try:
+            trash_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            messages.append(f"❌ Error creating trash directory {trash_dir}: {e}")
+            return messages # Cannot proceed if trash dir creation fails
+
+        for img_path_str in image_paths_to_move:
+            try:
+                source_path = Path(img_path_str) # This path is already relative to project root, e.g. "vm/image.png"
+
+                # We need to ensure source_path is interpreted correctly if it's not absolute
+                # If img_path_str is like "vm/image.png", Path(img_path_str) is correct.
+                # If it could be just "image.png" (expecting it inside VM_DIR), then source_path = VM_DIR / img_path_str
+                # Given current usage, img_path_str is 'vm/generated_img.png'
+
+                if not source_path.is_absolute() and not str(source_path).startswith(str(VM_DIR)):
+                     # This case should ideally not happen if paths are consistently from generated_image_paths_batch
+                    source_path = VM_DIR / source_path.name
+
+
+                dest_path = trash_dir / source_path.name
+
+                if source_path.exists() and source_path.is_file():
+                    try:
+                        shutil.move(str(source_path), str(dest_path))
+                        messages.append(f"🗑️ Moved '{source_path.name}' to '{TRASH_DIR_NAME}/'.")
+                    except Exception as e:
+                        messages.append(f"❌ Error moving '{source_path.name}' to trash: {e}")
+                elif not source_path.exists():
+                    messages.append(f"ℹ️ File not found, cannot trash: '{img_path_str}' (expected at {source_path}).")
+                elif not source_path.is_file():
+                    messages.append(f"ℹ️ Path is not a file, cannot trash: '{img_path_str}'.")
+            except Exception as e: # Catch any error related to path processing for a single file
+                messages.append(f"❌ Unexpected error processing path '{img_path_str}' for trashing: {e}")
+
+        return messages
 
     def _get_collaborative_refinement(self):
         """Get collaborative refinement suggestions"""
@@ -418,9 +721,14 @@ Focus on actionable improvements that leverage all three agent perspectives.
             "recent_changes": self._get_recent_changes()
         }
 
-    def _build_enhanced_prompt(self, user_prompt, system_prompt):
+    def _build_enhanced_prompt(self, user_prompt, system_prompt, proactive_art_advice=None):
         """Build enhanced prompt with comprehensive context"""
+        # Placeholder for integrating proactive_art_advice into the prompt
+        # For now, it's just accepted as a parameter.
+        # In a future step, this method will be modified to use proactive_art_advice.
         prompt_parts = [{"text": f"{system_prompt}\n\n**PROJECT STATUS:**\n"}]
+        if proactive_art_advice:
+            prompt_parts.append({"text": f"\n**PROACTIVE ART GUIDANCE:**\n{proactive_art_advice}\n"})
 
         # Add current files with content
         if VM_DIR.exists():
@@ -947,6 +1255,89 @@ class EnhancedGeminiIDE(tk.Tk):
         self.geometry("1600x1000")
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        # --- Dark Theme Colors ---
+        self.bg_color_dark = "#2E2E2E"    # Dark gray for main backgrounds
+        self.fg_color_light = "#F0F0F0"   # Light gray/white for text
+        self.bg_color_medium = "#3C3C3C"  # A slightly lighter dark shade
+        self.border_color = "#505050"     # A color for borders
+        self.accent_color = "#007ACC"     # Accent color for selections/highlights
+
+        # Chat-specific colors
+        self.user_chat_color = "#7FFFD4"      # Aquamarine
+        self.system_chat_color = "#4DB6AC"    # Tealish (a bit desaturated cyan/green)
+        self.timestamp_chat_color = "#B0B0B0" # Lighter Gray for timestamps
+        self.error_chat_color = "#FF8A80"     # Softer Red for errors in chat (was #ff0000)
+
+        # Agent status indicator colors
+        self.agent_status_inactive_color = "#66BB6A" # Medium Green
+        self.agent_status_active_color = "#FFA726"   # Amber/Orange
+        self.agent_status_error_color = "#EF5350"    # Soft Red
+
+        self.style = ttk.Style()
+        self.style.theme_use('clam') # Using a theme that allows more customization
+
+        # Main window background
+        self.configure(bg=self.bg_color_dark)
+
+        # --- Base ttk Styles ---
+        self.style.configure("TFrame", background=self.bg_color_dark)
+        self.style.configure(
+            "TLabelframe",
+            background=self.bg_color_dark,
+            bordercolor=self.border_color,
+            relief=tk.SOLID, # Added relief for better visibility
+            borderwidth=1
+        )
+        self.style.configure(
+            "TLabelframe.Label",
+            background=self.bg_color_dark,
+            foreground=self.fg_color_light,
+            padding=(5, 2) # Add some padding to labelframe labels
+        )
+        # Add a border to PanedWindow Sash for visibility
+        self.style.configure("TPanedwindow", background=self.bg_color_dark) # Main pane background
+        self.style.configure("Sash", background=self.bg_color_medium, bordercolor=self.border_color, relief=tk.RAISED, sashthickness=6)
+
+        # Scrollbar Style (for Treeview and any other ttk.Scrollbar)
+        self.style.configure("Vertical.TScrollbar", background=self.bg_color_medium, troughcolor=self.bg_color_dark, bordercolor=self.border_color, arrowcolor=self.fg_color_light, relief=tk.FLAT, arrowsize=12)
+        self.style.configure("Horizontal.TScrollbar", background=self.bg_color_medium, troughcolor=self.bg_color_dark, bordercolor=self.border_color, arrowcolor=self.fg_color_light, relief=tk.FLAT, arrowsize=12)
+        self.style.map("TScrollbar",
+            background=[('active', self.accent_color), ('!active', self.bg_color_medium)],
+            arrowcolor=[('pressed', self.accent_color), ('!pressed', self.fg_color_light)]
+        )
+
+        # Button Style
+        self.style.configure("TButton", background=self.accent_color, foreground="white", padding=(8, 4), font=('Segoe UI', 9, 'bold'), borderwidth=1, relief=tk.RAISED, bordercolor=self.accent_color)
+        self.style.map("TButton",
+                       background=[('active', '#005f9e'), ('pressed', '#004c8c'), ('disabled', self.bg_color_medium)],
+                       foreground=[('disabled', self.border_color)],
+                       relief=[('pressed', tk.SUNKEN), ('!pressed', tk.RAISED)])
+
+        # Treeview Style
+        self.style.configure("Treeview", background=self.bg_color_medium, foreground=self.fg_color_light, fieldbackground=self.bg_color_medium, rowheight=22, borderwidth=1, relief=tk.SOLID, bordercolor=self.border_color)
+        self.style.map("Treeview",
+                       background=[('selected', self.accent_color)],
+                       foreground=[('selected', "white")])
+        self.style.configure("Treeview.Heading", background=self.bg_color_dark, foreground=self.fg_color_light, relief=tk.FLAT, padding=(5, 5), font=('Segoe UI', 9, 'bold'), borderwidth=0)
+        self.style.map("Treeview.Heading",
+                       background=[('active', self.bg_color_medium)],
+                       relief=[('active', tk.GROOVE), ('!active', tk.FLAT)])
+
+        # Notebook Style
+        self.style.configure("TNotebook", background=self.bg_color_dark, tabmargins=(5, 5, 5, 0), borderwidth=1, bordercolor=self.border_color)
+        self.style.configure("TNotebook.Tab", background=self.bg_color_medium, foreground=self.fg_color_light, padding=(8,4), font=('Segoe UI', 9), borderwidth=0, relief=tk.FLAT)
+        self.style.map("TNotebook.Tab",
+                       background=[("selected", self.accent_color), ("active", self.bg_color_dark)],
+                       foreground=[("selected", "white"), ("active", self.fg_color_light)],
+                       relief=[("selected", tk.FLAT), ("!selected", tk.FLAT)],
+                       borderwidth=[("selected",0)])
+
+        # General Label Style (for Enhancer toggle label, status bar agent icons)
+        self.style.configure("TLabel", background=self.bg_color_dark, foreground=self.fg_color_light, padding=2)
+        # Specific style for status bar text for more control if needed
+        self.style.configure("Status.TLabel", background=self.bg_color_dark, foreground=self.fg_color_light, padding=5, relief=tk.FLAT)
+
+
         VM_DIR.mkdir(exist_ok=True)
         self.msg_queue = queue.Queue()
         self.current_image = None
@@ -997,6 +1388,12 @@ class EnhancedGeminiIDE(tk.Tk):
         settings_menu.add_command(label="⚙️ Agent Settings", command=self.show_agent_settings)
         menubar.add_cascade(label="Settings", menu=settings_menu)
 
+        # Apply basic styling to top-level menubar
+        menubar.config(bg=self.bg_color_dark, fg=self.fg_color_light, activebackground=self.accent_color, activeforeground="white", relief=tk.FLAT, borderwidth=0)
+        # Style individual menus
+        for menu_item in [file_menu, agents_menu, settings_menu]:
+            menu_item.config(bg=self.bg_color_medium, fg=self.fg_color_light, activebackground=self.accent_color, activeforeground="white", relief=tk.FLAT, borderwidth=0)
+
         self.config(menu=menubar)
 
     def _create_enhanced_layout(self):
@@ -1012,10 +1409,10 @@ class EnhancedGeminiIDE(tk.Tk):
         img_frame = ttk.LabelFrame(left_frame, text="🖼️ Visual Preview", padding=5)
         img_frame.pack(fill=tk.X, pady=(0, 5))
         
-        self.canvas = tk.Canvas(img_frame, bg='#f0f0f0', height=320)
+        self.canvas = tk.Canvas(img_frame, bg=self.bg_color_medium, height=320, highlightthickness=0) # Use defined color
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.create_text(160, 160, text="🖼️ No image selected\nImages will be analyzed by Art Critic", 
-                               fill="gray", font=("Arial", 11), justify=tk.CENTER)
+        self.canvas.create_text(160, 160, text="🖼️ No image selected\nImages will be analyzed by Art Critic",
+                               fill=self.fg_color_light, font=("Arial", 11), justify=tk.CENTER) # Use defined color
 
         # Enhanced file tree
         tree_frame = ttk.LabelFrame(left_frame, text="📁 Project Explorer", padding=5)
@@ -1056,11 +1453,17 @@ class EnhancedGeminiIDE(tk.Tk):
             font=("Consolas", 12),
             padx=15,
             pady=15,
-            bg="#1e1e1e",
-            fg="#dcdcdc",
-            insertbackground="#dcdcdc"
+            bg=self.bg_color_medium, # Use defined color "#1e1e1e" is very dark
+            fg=self.fg_color_light,
+            insertbackground=self.fg_color_light, # Cursor color
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=1, # Add a subtle border
+            highlightbackground=self.border_color
         )
         self.editor.pack(fill=tk.BOTH, expand=True)
+        # ScrolledText frame background - it's a tk.Frame
+        self.editor.frame.config(background=self.bg_color_dark)
         self.notebook.add(editor_frame, text="📝 Code Editor")
 
         # Enhanced multi-agent chat tab
@@ -1072,9 +1475,16 @@ class EnhancedGeminiIDE(tk.Tk):
             padx=15,
             pady=15,
             state="disabled",
-            bg="#f8f9fa"
+            bg=self.bg_color_medium, # Use defined color
+            fg=self.fg_color_light,   # Use defined color
+            insertbackground=self.fg_color_light, # Cursor color (though state is disabled)
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=1, # Add a subtle border
+            highlightbackground=self.border_color
         )
         self.chat.pack(fill=tk.BOTH, expand=True)
+        self.chat.frame.config(background=self.bg_color_dark)
         self.notebook.add(chat_frame, text="🤖 Multi-Agent Chat")
 
         # Project insights tab
@@ -1086,9 +1496,15 @@ class EnhancedGeminiIDE(tk.Tk):
             padx=15,
             pady=15,
             state="disabled",
-            bg="#f0f8ff"
+            bg=self.bg_color_medium, # Use defined color
+            fg=self.fg_color_light,
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=1, # Add a subtle border
+            highlightbackground=self.border_color
         )
         self.insights.pack(fill=tk.BOTH, expand=True)
+        self.insights.frame.config(background=self.bg_color_dark)
         self.notebook.add(insights_frame, text="📊 Project Insights")
 
         # Enhanced input area
@@ -1103,8 +1519,14 @@ class EnhancedGeminiIDE(tk.Tk):
             font=("Segoe UI", 11),
             padx=10,
             pady=10,
-            bg="#ffffff",
-            relief=tk.RAISED
+            bg=self.bg_color_medium, # Use defined color
+            fg=self.fg_color_light,    # Use defined color
+            insertbackground=self.fg_color_light, # Cursor color
+            relief=tk.FLAT,
+            borderwidth=1, # Small border
+            highlightbackground=self.border_color, # Border when not focused
+            highlightcolor=self.accent_color,    # Border when focused
+            highlightthickness=1
         )
         self.input_txt.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self.input_txt.bind("<Control-Return>", lambda e: self.send_enhanced_prompt())
@@ -1236,23 +1658,27 @@ class EnhancedGeminiIDE(tk.Tk):
         status_bar = ttk.Label(
             status_frame, 
             textvariable=self.status_var,
-            relief=tk.SUNKEN,
-            anchor=tk.W,
-            padding=5
+            style="Status.TLabel", # Apply specific status bar label style
+            anchor=tk.W
+            # relief=tk.SUNKEN, # relief is handled by ttk style
+            # padding=5 # padding is handled by ttk style
         )
         status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Agent status indicators
-        self.agent_status_frame = ttk.Frame(status_frame)
+        # Agent status indicators (ttk.Label, will inherit general TLabel style)
+        self.agent_status_frame = ttk.Frame(status_frame) # Will inherit TFrame style
         self.agent_status_frame.pack(side=tk.RIGHT, padx=5)
 
-        self.main_status = ttk.Label(self.agent_status_frame, text="🤖", foreground="green")
+        # self.main_status_color_default and self.main_status_color_processing are now replaced by
+        # self.agent_status_inactive_color and self.agent_status_active_color defined in __init__
+
+        self.main_status = ttk.Label(self.agent_status_frame, text="🤖", foreground=self.agent_status_inactive_color)
         self.main_status.pack(side=tk.LEFT, padx=2)
         
-        self.critic_status = ttk.Label(self.agent_status_frame, text="📊", foreground="green")
+        self.critic_status = ttk.Label(self.agent_status_frame, text="📊", foreground=self.agent_status_inactive_color)
         self.critic_status.pack(side=tk.LEFT, padx=2)
         
-        self.art_status = ttk.Label(self.agent_status_frame, text="🎨", foreground="green")
+        self.art_status = ttk.Label(self.agent_status_frame, text="🎨", foreground=self.agent_status_inactive_color)
         self.art_status.pack(side=tk.LEFT, padx=2)
 
     def configure_enhanced_agents(self, api_key):
@@ -1304,7 +1730,7 @@ class EnhancedGeminiIDE(tk.Tk):
         if not text or text.startswith("💬 Ask the multi-agent"):
             return
 
-        self.add_chat_message("👤 You", text)
+        self.add_chat_message("👤 You", text, color=self.user_chat_color) # Use defined user color
         self.input_txt.delete("1.0", tk.END)
 
         self.input_txt.config(state="disabled")
@@ -1313,9 +1739,9 @@ class EnhancedGeminiIDE(tk.Tk):
         self.status_var.set("🔄 Enhanced Multi-Agent System Processing...")
 
         # Update agent status to processing
-        self.main_status.config(foreground="orange")
-        self.critic_status.config(foreground="orange")  
-        self.art_status.config(foreground="orange")
+        self.main_status.config(foreground=self.agent_status_active_color)
+        self.critic_status.config(foreground=self.agent_status_active_color)
+        self.art_status.config(foreground=self.agent_status_active_color)
 
         threading.Thread(
             target=self._process_enhanced_prompt, 
@@ -1369,9 +1795,9 @@ class EnhancedGeminiIDE(tk.Tk):
                     self.screenshot_btn.config(state="normal") # Re-enable screenshot button
                     self.status_var.set("✅ Enhanced Multi-Agent System Ready")
                     # Reset agent status
-                    self.main_status.config(foreground="green")
-                    self.critic_status.config(foreground="green")
-                    self.art_status.config(foreground="green")
+                    self.main_status.config(foreground=self.agent_status_inactive_color)
+                    self.critic_status.config(foreground=self.agent_status_inactive_color)
+                    self.art_status.config(foreground=self.agent_status_inactive_color)
 
         except queue.Empty:
             pass
@@ -1465,7 +1891,7 @@ class EnhancedGeminiIDE(tk.Tk):
         safe_sender_name = re.sub(r'\W+', '', sender) # Remove non-alphanumeric
         sender_tag = f"sender_{safe_sender_name.strip()}"
         self.chat.tag_configure(sender_tag, foreground=color, font=("Segoe UI", 11, "bold"))
-        self.chat.tag_configure("timestamp", foreground="gray", font=("Segoe UI", 9))
+        self.chat.tag_configure("timestamp", foreground=self.timestamp_chat_color, font=("Segoe UI", 9)) # Use defined color
         self.chat.tag_configure("message", font=("Segoe UI", 11))
         
         # Insert message
@@ -2081,12 +2507,16 @@ class EnhancedGeminiIDE(tk.Tk):
                         "✨ Prompt Enhancer": "#FFD700", # Gold color for enhancer
                         "🤝 Collaborative": "#4169E1"
                     }
-                    color = agent_colors.get(agent_name, "#000000")
+                    color = agent_colors.get(agent_name, self.fg_color_light) # Default to fg_color_light
                     self.add_chat_message(agent_name, msg["content"], color)
                 elif msg["type"] == "system":
-                    self.add_chat_message("🔧 System", msg["content"], "#2E8B57")
+                    self.add_chat_message("🔧 System", msg["content"], color=self.system_chat_color) # Use defined system color
                 elif msg["type"] == "error":
-                    self.add_chat_message("❌ Error", msg["content"], "#ff0000")
+                    self.add_chat_message("❌ Error", msg["content"], color=self.error_chat_color) # Use defined error color
+                    # Set agent icons to error color
+                    self.main_status.config(foreground=self.agent_status_error_color)
+                    self.critic_status.config(foreground=self.agent_status_error_color)
+                    self.art_status.config(foreground=self.agent_status_error_color)
                 elif msg["type"] == "screenshot_success":
                     filename = msg["content"]
                     self._finalize_screenshot_processing(filename)
