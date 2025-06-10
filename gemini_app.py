@@ -251,31 +251,26 @@ class EnhancedMultiAgentSystem:
             # Fallback to original prompt if enhancer fails
             return user_prompt
 
-    def run_enhanced_interaction(self, original_user_prompt):
-        """Enhanced multi-agent interaction with grading and retry system"""
-        if not self.client:
-            yield {"type": "error", "content": "AI system not configured. Please set API key."}
-            return
-
+    def _handle_prompt_enhancement(self, original_user_prompt):
+        """Handles the prompt enhancement phase."""
         if self.prompt_enhancer_enabled:
-            # Initial prompt enhancement (occurs only once before retries)
             yield {"type": "system", "content": "✨ Enhancing prompt..."}
+            yield {"type": "agent_status_update", "agent": "prompt_enhancer", "status": "active"}
             enhanced_user_prompt = self._get_enhanced_prompt(original_user_prompt)
+            yield {"type": "agent_status_update", "agent": "prompt_enhancer", "status": "inactive"}
             yield {"type": "agent", "agent": "✨ Prompt Enhancer", "content": enhanced_user_prompt}
+            return enhanced_user_prompt
         else:
-            enhanced_user_prompt = original_user_prompt
             yield {"type": "system", "content": "✨ Prompt enhancer disabled. Using original prompt."}
+            return original_user_prompt
 
+    def _handle_proactive_art_guidance(self, enhanced_user_prompt):
+        """Handles the proactive art guidance phase."""
         proactive_art_advice = None
-        # Check if proactive art guidance is needed
-        if self._should_invoke_art_critic(enhanced_user_prompt, "", []): # Pass empty values for main_response and implementation_results
+        if self._should_invoke_art_critic(enhanced_user_prompt, "", []):
             yield {"type": "system", "content": "🎨 Art Critic providing initial guidance..."}
-            # Assume _get_proactive_art_guidance exists and will be implemented later
-            # For now, this call might error if the method is not defined.
-            # We are only adding the placeholder and structure.
+            yield {"type": "agent_status_update", "agent": "art_critic_proactive", "status": "active"}
             try:
-                # This method is not yet implemented, so we'll wrap it in a try-except
-                # and proceed if it's not found, as per subtask instructions.
                 if hasattr(self, "_get_proactive_art_guidance"):
                     proactive_art_advice = self._get_proactive_art_guidance(enhanced_user_prompt)
                     if proactive_art_advice:
@@ -283,272 +278,277 @@ class EnhancedMultiAgentSystem:
                 else:
                     yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented."}
             except AttributeError:
-                 yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented (AttributeError)."}
+                yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented (AttributeError)."}
+            finally:
+                yield {"type": "agent_status_update", "agent": "art_critic_proactive", "status": "inactive"}
+        return proactive_art_advice
 
+    def _execute_main_coder_phase(self, current_main_coder_prompt, proactive_art_advice, attempt_suffix):
+        """Executes the main coder's implementation phase."""
+        yield {"type": "system", "content": f"🚀 Main Coder Agent analyzing and implementing...{attempt_suffix}"}
+        yield {"type": "agent_status_update", "agent": "main_coder", "status": "active"}
+
+        main_prompt_parts = self._build_enhanced_prompt(
+            current_main_coder_prompt,
+            MAIN_AGENT_PROMPT,
+            proactive_art_advice=proactive_art_advice
+        )
+
+        main_response = self.client.models.generate_content(
+            model=TEXT_MODEL_NAME,
+            contents=main_prompt_parts
+        )
+        yield {"type": "agent_status_update", "agent": "main_coder", "status": "inactive"}
+
+        self._log_interaction("user", current_main_coder_prompt)
+        self._log_interaction("main_coder", main_response.text)
+
+        yield {"type": "agent", "agent": "🤖 Main Coder", "content": main_response.text}
+
+        if main_response.text.count("`generate_image(") >= 2:
+            yield {"type": "system", "content": "ℹ️ Main Coder is generating multiple image variations..."}
+
+        implementation_results = []
+        generated_image_paths_batch = []
+        for result in self._process_enhanced_commands(main_response.text):
+            implementation_results.append(result)
+            yield result
+            if result.get("type") == "file_changed":
+                file_path_str = result.get("content", "")
+                if file_path_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                    if Path(file_path_str).parent.name == VM_DIR.name or Path(file_path_str).parent.parent.name == VM_DIR.name:
+                        generated_image_paths_batch.append(file_path_str)
+        return main_response.text, implementation_results, generated_image_paths_batch
+
+    def _perform_critic_evaluations(self, original_user_prompt, main_response_text, implementation_results, generated_image_paths_batch):
+        """Performs evaluations by Code Critic and Art Critic."""
+        critic_grade = None
+        all_art_critiques = []
+        best_image_details = None
+        final_art_grade_for_overall_calc = None
+
+        should_use_critic = self._should_invoke_code_critic(original_user_prompt, main_response_text, implementation_results)
+        should_use_art_critic = self._should_invoke_art_critic(original_user_prompt, main_response_text, implementation_results)
+
+        if should_use_critic and self.grading_enabled:
+            yield {"type": "system", "content": "🔍 Code Critic Agent performing deep analysis and grading..."}
+            yield {"type": "agent_status_update", "agent": "code_critic", "status": "active"}
+            critic_analysis = self._get_code_critique(original_user_prompt, main_response_text, implementation_results)
+            yield {"type": "agent_status_update", "agent": "code_critic", "status": "inactive"}
+            if critic_analysis:
+                yield {"type": "agent", "agent": "📊 Code Critic", "content": critic_analysis}
+                critic_grade = self._extract_grade(critic_analysis)
+
+        if self.grading_enabled and generated_image_paths_batch:
+            yield {"type": "system", "content": "🎨 Art Critic Agent analyzing generated visual elements and grading (batch)..."}
+            yield {"type": "agent_status_update", "agent": "art_critic", "status": "active"}
+            for i, image_path in enumerate(generated_image_paths_batch):
+                image_filename = os.path.basename(str(image_path))
+                yield {"type": "system", "content": f"🎨 Art Critic evaluating image: {image_filename} ({i+1}/{len(generated_image_paths_batch)})..."}
+                art_analysis_single = self._get_art_critique(original_user_prompt, main_response_text, implementation_results, target_image_path=str(image_path))
+                if art_analysis_single:
+                    current_art_grade = self._extract_grade(art_analysis_single)
+                    all_art_critiques.append({"image_path": str(image_path), "critique_text": art_analysis_single, "grade": current_art_grade})
+                    yield {"type": "agent", "agent": f"🎭 Art Critic ({image_filename})", "content": art_analysis_single}
+            yield {"type": "agent_status_update", "agent": "art_critic", "status": "inactive"}
+        elif should_use_art_critic and self.grading_enabled:
+            yield {"type": "system", "content": "🎨 Art Critic Agent analyzing visual elements (general)..."}
+            yield {"type": "agent_status_update", "agent": "art_critic", "status": "active"}
+            art_analysis_general = self._get_art_critique(original_user_prompt, main_response_text, implementation_results, target_image_path=None)
+            yield {"type": "agent_status_update", "agent": "art_critic", "status": "inactive"}
+            if art_analysis_general:
+                current_art_grade_general = self._extract_grade(art_analysis_general)
+                all_art_critiques.append({"image_path": "general_critique", "critique_text": art_analysis_general, "grade": current_art_grade_general})
+                yield {"type": "agent", "agent": "🎭 Art Critic", "content": art_analysis_general}
+
+        highest_art_grade = -1
+        if all_art_critiques:
+            for critique_item in all_art_critiques:
+                current_grade = critique_item.get('grade')
+                if current_grade is not None and current_grade > highest_art_grade:
+                    highest_art_grade = current_grade
+                    best_image_details = critique_item
+            if best_image_details:
+                yield {"type": "system", "content": f"🏆 Selected '{os.path.basename(best_image_details['image_path'])}' as the best image with a grade of {best_image_details['grade']}/100."}
+                final_art_grade_for_overall_calc = best_image_details['grade']
+            else:
+                yield {"type": "system", "content": "ℹ️ No best image could be determined from the batch (no valid grades)."}
+        elif generated_image_paths_batch: # Images generated but not graded
+             yield {"type": "system", "content": "ℹ️ Images were generated but not graded by Art Critic."}
+
+
+        return critic_grade, all_art_critiques, best_image_details, final_art_grade_for_overall_calc
+
+    def _handle_retry_and_finalization(self, original_user_prompt, current_main_coder_prompt_ref_for_retry, # Pass as a list to modify
+                                       critic_grade, all_art_critiques, best_image_details,
+                                       final_art_grade_for_overall_calc, generated_image_paths_batch,
+                                       main_response_text, implementation_results): # Added main_response_text, implementation_results
+        """Handles the retry logic, image trashing, and final messages."""
+        perform_retry = False
+        retry_reason_message = ""
+        art_grade_display = final_art_grade_for_overall_calc if final_art_grade_for_overall_calc is not None else "N/A"
+        overall_grade = self._calculate_overall_grade(critic_grade, final_art_grade_for_overall_calc)
+
+        if self.grading_enabled and generated_image_paths_batch and any(cq.get('grade') is not None for cq in all_art_critiques):
+            num_graded_batch_images = 0
+            failing_batch_images_count = 0
+            for critique_item in all_art_critiques:
+                if critique_item.get('image_path') in generated_image_paths_batch and critique_item.get('grade') is not None:
+                    num_graded_batch_images += 1
+                    if critique_item.get('grade') < 70:
+                        failing_batch_images_count += 1
+            if num_graded_batch_images > 0 and num_graded_batch_images == failing_batch_images_count:
+                perform_retry = True
+                retry_reason_message = "⚠️ None of the generated images met the passing grade (all < 70/100)."
+
+        if not perform_retry and self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None):
+            if overall_grade < 70:
+                perform_retry = True
+                retry_reason_message = f"⚠️ Overall grade ({overall_grade}/100) is below 70."
+
+        if self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None):
+            yield {"type": "system", "content": f"📊 Overall Grade: {overall_grade}/100 (Code: {critic_grade or 'N/A'}, Art: {art_grade_display})"}
+
+        if perform_retry and self.current_attempt < self.max_retry_attempts:
+            yield {"type": "system", "content": f"{retry_reason_message} Requesting Main Coder to improve... (Attempt {self.current_attempt + 1}/{self.max_retry_attempts})"}
+            art_critique_summary_for_retry = "No specific art critiques available for this attempt.\n"
+            if all_art_critiques:
+                art_critique_summary_for_retry = "Summary of Art Critiques (focus on best image if applicable):\n"
+                # ... (rest of art_critique_summary_for_retry logic remains the same)
+                if best_image_details:
+                    art_critique_summary_for_retry += (f"Best Image ({os.path.basename(best_image_details['image_path'])}, "
+                                                       f"Grade: {best_image_details['grade'] or 'N/A'}):\n"
+                                                       f"{best_image_details['critique_text'][:400]}...\n\n")
+                other_failing_critiques = [c for c in all_art_critiques if c.get('grade', 0) < 70 and c != best_image_details]
+                if other_failing_critiques:
+                    art_critique_summary_for_retry += "Other critiques for images needing improvement:\n"
+                    for c_item in other_failing_critiques[:2]:
+                        art_critique_summary_for_retry += f"- {os.path.basename(c_item['image_path'])} (Grade: {c_item['grade']}): {c_item['critique_text'][:200]}...\n"
+                elif len(all_art_critiques) > 1 and best_image_details and best_image_details.get('grade', 0) >=70 :
+                     art_critique_summary_for_retry += "The best image was acceptable, but other aspects of the request or code may need improvement if overall grade is low.\n"
+                elif not best_image_details and all_art_critiques:
+                    art_critique_summary_for_retry = "Multiple art critiques provided. Please review them in the chat history.\n"
+
+            retry_intro = (f"RETRY (Original User Prompt: '{original_user_prompt}'):\n\n"
+                           f"PREVIOUS ATTEMPT FEEDBACK:\n"
+                           f"Code Critic Grade: {critic_grade or 'N/A'}\n"
+                           f"Art Critic Best Image Grade: {art_grade_display}\n"
+                           f"Overall Grade: {overall_grade}/100\n"
+                           f"{retry_reason_message}\n\n"
+                           f"Please improve the implementation based on the critique feedback above. "
+                           f"Focus on addressing issues in both code and image generation (if applicable).\n\n"
+                           f"Art Critiques Summary:\n{art_critique_summary_for_retry.strip()}")
+            current_main_coder_prompt_ref_for_retry[0] = f"{retry_intro}\n\n{current_main_coder_prompt_ref_for_retry[0]}" # Modify the passed list's element
+            return True # Indicate retry
+
+        elif perform_retry: # Max attempts reached
+            yield {"type": "system", "content": f"⚠️ Maximum attempts reached. {retry_reason_message} Final overall grade: {overall_grade}/100"}
+        elif self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None) and overall_grade >= 70:
+            yield {"type": "system", "content": f"✅ Grade acceptable ({overall_grade}/100). Implementation approved!"}
+        elif not self.grading_enabled:
+            yield {"type": "system", "content": "✅ Processing complete (grading disabled)."}
+            for agent_status_msg_type in ["prompt_enhancer", "art_critic_proactive", "main_coder", "code_critic", "art_critic"]:
+                yield {"type": "agent_status_update", "agent": agent_status_msg_type, "status": "inactive"}
+
+        # --- Loser Image Handling ---
+        paths_to_trash_this_attempt = []
+        if generated_image_paths_batch:
+            best_image_path_final = best_image_details.get('image_path') if best_image_details else None
+            best_image_grade_final = best_image_details.get('grade', -1) if best_image_details else -1
+            if perform_retry:
+                paths_to_trash_this_attempt.extend(generated_image_paths_batch)
+                yield {"type": "system", "content": f"🗑️ Discarding all {len(generated_image_paths_batch)} images from this attempt due to retry."}
+            else:
+                if best_image_path_final and best_image_grade_final >= 70:
+                    for img_path in generated_image_paths_batch:
+                        if img_path != best_image_path_final:
+                            paths_to_trash_this_attempt.append(img_path)
+                    if paths_to_trash_this_attempt:
+                        yield {"type": "system", "content": f"🗑️ Keeping best image '{os.path.basename(best_image_path_final)}'. Trashing {len(paths_to_trash_this_attempt)} other variants."}
+                else:
+                    paths_to_trash_this_attempt.extend(generated_image_paths_batch)
+                    if generated_image_paths_batch:
+                        yield {"type": "system", "content": f"🗑️ No single best image met criteria on final attempt. Trashing all {len(generated_image_paths_batch)} generated images."}
+
+        if paths_to_trash_this_attempt:
+            unique_paths_to_trash = list(set(paths_to_trash_this_attempt))
+            if unique_paths_to_trash:
+                trash_path_display = Path(VM_DIR) / TRASH_DIR_NAME
+                yield {"type": "system", "content": f"ℹ️ Moving {len(unique_paths_to_trash)} non-selected/failed image(s) to the '{trash_path_display}' folder..."}
+                for log_msg in self._move_to_trash(unique_paths_to_trash):
+                    yield {"type": "system", "content": log_msg}
+
+        # Phase 4: Collaborative Refinement
+        should_use_critic = self._should_invoke_code_critic(original_user_prompt, main_response_text, implementation_results) # Re-check based on original conditions
+        should_use_art_critic = self._should_invoke_art_critic(original_user_prompt, main_response_text, implementation_results) # Re-check
+        if (should_use_critic or should_use_art_critic) and self._needs_refinement(implementation_results):
+            yield {"type": "system", "content": "🔄 Agents collaborating on final refinements..."}
+            refinement_suggestions = self._get_collaborative_refinement()
+            if refinement_suggestions:
+                yield {"type": "agent", "agent": "🤝 Collaborative", "content": refinement_suggestions}
+
+        yield {"type": "system", "content": "✅ Multi-agent analysis complete!"}
+        for agent_status_msg_type in ["prompt_enhancer", "art_critic_proactive", "main_coder", "code_critic", "art_critic"]:
+             yield {"type": "agent_status_update", "agent": agent_status_msg_type, "status": "inactive"}
+        return False # Indicate no retry
+
+    def run_enhanced_interaction(self, original_user_prompt):
+        """Enhanced multi-agent interaction with grading and retry system"""
+        if not self.client:
+            yield {"type": "error", "content": "AI system not configured. Please set API key."}
+            return
+
+        # Initial prompt enhancement
+        enhanced_user_prompt = yield from self._handle_prompt_enhancement(original_user_prompt)
+
+        # Proactive art guidance
+        proactive_art_advice = yield from self._handle_proactive_art_guidance(enhanced_user_prompt)
 
         current_main_coder_prompt = enhanced_user_prompt
-
-        # Reset attempt counter for new interactions
         self.current_attempt = 0
         
         while self.current_attempt < self.max_retry_attempts:
             self.current_attempt += 1
             attempt_suffix = f" (Attempt {self.current_attempt}/{self.max_retry_attempts})" if self.current_attempt > 1 else ""
             
-            # Update project context
             self._update_project_context()
             
-            # Phase 1: Main Coder Agent Analysis and Implementation
-            yield {"type": "system", "content": f"🚀 Main Coder Agent analyzing and implementing...{attempt_suffix}"}
-            
-            # Pass proactive_art_advice to _build_enhanced_prompt
-            # Assuming _build_enhanced_prompt will be updated to accept this
-            main_prompt_parts = self._build_enhanced_prompt(
-                current_main_coder_prompt,
-                MAIN_AGENT_PROMPT,
-                proactive_art_advice=proactive_art_advice # Pass as new keyword argument
-            )
-            
             try:
-                main_response = self.client.models.generate_content(
-                    model=TEXT_MODEL_NAME,
-                    contents=main_prompt_parts
+                # Main Coder Phase
+                main_response_text, implementation_results, generated_image_paths_batch = yield from self._execute_main_coder_phase(
+                    current_main_coder_prompt, proactive_art_advice, attempt_suffix
+                )
+
+                # Critic Evaluations
+                critic_grade, all_art_critiques, best_image_details, final_art_grade_for_overall_calc = yield from self._perform_critic_evaluations(
+                    original_user_prompt, main_response_text, implementation_results, generated_image_paths_batch
                 )
                 
-                self._log_interaction("user", current_main_coder_prompt) # Log the prompt sent to main coder
-                self._log_interaction("main_coder", main_response.text)
+                # Retry Logic and Finalization
+                # Pass current_main_coder_prompt as a list to allow modification for retry
+                current_main_coder_prompt_list_for_retry = [enhanced_user_prompt] # Use enhanced_user_prompt for subsequent retries, not the already modified one.
                 
-                yield {"type": "agent", "agent": "🤖 Main Coder", "content": main_response.text}
-
-                # Check for multiple image generation commands
-                if main_response.text.count("`generate_image(") >= 2:
-                    yield {"type": "system", "content": "ℹ️ Main Coder is generating multiple image variations..."}
-                
-                # Execute commands and track changes
-                implementation_results = []
-                generated_image_paths_batch = [] # Initialize list here
-
-                for result in self._process_enhanced_commands(main_response.text):
-                    implementation_results.append(result)
-                    yield result # continue yielding all results for logging/UI updates
-
-                    # Check if this result is a generated image file path
-                    if result.get("type") == "file_changed":
-                        file_path_str = result.get("content", "")
-                        # Basic check for image extensions
-                        if file_path_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                            # Further check if it's likely from our VM_DIR, though generate_image should ensure this.
-                            # This is a basic check; more robust validation could be added if needed.
-                            if Path(file_path_str).parent.name == VM_DIR.name or Path(file_path_str).parent.parent.name == VM_DIR.name :
-                                generated_image_paths_batch.append(file_path_str)
-
-                # Phase 2: Smart Agent Selection with Grading
-                # Critics should see the original prompt to understand the user's raw request
-                should_use_critic = self._should_invoke_code_critic(original_user_prompt, main_response.text, implementation_results)
-                should_use_art_critic = self._should_invoke_art_critic(original_user_prompt, main_response.text, implementation_results)
-                
-                critic_grade = None
-                # art_grade = None # Replaced by individual grades in all_art_critiques
-                all_art_critiques = []
-                
-                if should_use_critic and self.grading_enabled:
-                    yield {"type": "system", "content": "🔍 Code Critic Agent performing deep analysis and grading..."}
-                    critic_analysis = self._get_code_critique(original_user_prompt, main_response.text, implementation_results)
-                    if critic_analysis:
-                        yield {"type": "agent", "agent": "📊 Code Critic", "content": critic_analysis}
-                        critic_grade = self._extract_grade(critic_analysis)
-
-                # Check if art critic should be invoked for any generated images
-                if self.grading_enabled and generated_image_paths_batch: # If images were generated and grading is on
-                    # This message is shown once before the loop if there are images to critique
-                    yield {"type": "system", "content": "🎨 Art Critic Agent analyzing generated visual elements and grading (batch)..."}
-                    
-                    for i, image_path in enumerate(generated_image_paths_batch):
-                        # Ensure image_path is a string and not a Path object for os.path.basename
-                        image_filename = os.path.basename(str(image_path))
-                        yield {"type": "system", "content": f"🎨 Art Critic evaluating image: {image_filename} ({i+1}/{len(generated_image_paths_batch)})..."}
-                        art_analysis_single = self._get_art_critique(
-                            original_user_prompt,
-                            main_response.text,
-                            implementation_results,
-                            target_image_path=str(image_path) # Ensure it's a string
-                        )
-                        if art_analysis_single:
-                            current_art_grade = self._extract_grade(art_analysis_single)
-                            critique_entry = {
-                                "image_path": str(image_path),
-                                "critique_text": art_analysis_single,
-                                "grade": current_art_grade
-                            }
-                            all_art_critiques.append(critique_entry)
-                            yield {
-                                "type": "agent",
-                                "agent": f"🎭 Art Critic ({image_filename})",
-                                "content": art_analysis_single
-                            }
-                elif should_use_art_critic and self.grading_enabled: # Case where art critic was requested but no images were batch generated (e.g. analyze existing image)
-                    yield {"type": "system", "content": "🎨 Art Critic Agent analyzing visual elements (general)..."}
-                    art_analysis_general = self._get_art_critique(original_user_prompt, main_response.text, implementation_results, target_image_path=None)
-                    if art_analysis_general:
-                        current_art_grade_general = self._extract_grade(art_analysis_general)
-                        # Store it in a way that the later logic can find an art grade
-                        all_art_critiques.append({
-                            "image_path": "general_critique", # Placeholder path
-                            "critique_text": art_analysis_general,
-                            "grade": current_art_grade_general
-                        })
-                        yield {"type": "agent", "agent": "🎭 Art Critic", "content": art_analysis_general}
+                should_retry = yield from self._handle_retry_and_finalization(
+                    original_user_prompt, current_main_coder_prompt_list_for_retry,
+                    critic_grade, all_art_critiques, best_image_details,
+                    final_art_grade_for_overall_calc, generated_image_paths_batch,
+                    main_response_text, implementation_results # Pass these for re-evaluation if needed by _handle_retry_and_finalization
+                )
+                current_main_coder_prompt = current_main_coder_prompt_list_for_retry[0]
 
 
-                # Phase 3: Grade Evaluation and Retry Decision
-
-                best_image_details = None
-                highest_art_grade = -1 # Assuming grades are 0-100
-
-                if all_art_critiques:
-                    for critique_item in all_art_critiques:
-                        current_grade = critique_item.get('grade')
-                        if current_grade is not None and current_grade > highest_art_grade:
-                            highest_art_grade = current_grade
-                            best_image_details = critique_item
-                    
-                    if best_image_details:
-                        yield {"type": "system", "content": f"🏆 Selected '{os.path.basename(best_image_details['image_path'])}' as the best image with a grade of {best_image_details['grade']}/100."}
-                        final_art_grade_for_overall_calc = best_image_details['grade']
-                    else:
-                        yield {"type": "system", "content": "ℹ️ No best image could be determined from the batch (no valid grades)."}
-                        final_art_grade_for_overall_calc = None # Or a default low score if preferred
+                if should_retry:
+                    continue
                 else:
-                    # No art critiques were performed (e.g., non-image task, or art critic was skipped)
-                    final_art_grade_for_overall_calc = None
-                    if generated_image_paths_batch: # Images were generated but not critiqued
-                        yield {"type": "system", "content": "ℹ️ Images were generated but not graded by Art Critic."}
-                    # If no images were generated, no message specific to best image selection is needed here.
-
-                perform_retry = False
-                retry_reason_message = ""
-                art_grade_display = final_art_grade_for_overall_calc if final_art_grade_for_overall_calc is not None else "N/A" # For display
-                overall_grade = self._calculate_overall_grade(critic_grade, final_art_grade_for_overall_calc)
-
-
-                if self.grading_enabled and generated_image_paths_batch and any(cq.get('grade') is not None for cq in all_art_critiques):
-                    # Image generation was attempted and at least one image was graded
-                    # Check if ALL generated images in the batch failed
-                    # This assumes all_art_critiques only contains items from the current generated_image_paths_batch if generated_image_paths_batch is not empty
-                    num_graded_batch_images = 0
-                    failing_batch_images_count = 0
-                    for critique_item in all_art_critiques:
-                        if critique_item.get('image_path') in generated_image_paths_batch and critique_item.get('grade') is not None:
-                            num_graded_batch_images +=1
-                            if critique_item.get('grade') < 70:
-                                failing_batch_images_count +=1
-
-                    if num_graded_batch_images > 0 and num_graded_batch_images == failing_batch_images_count:
-                        perform_retry = True
-                        retry_reason_message = "⚠️ None of the generated images met the passing grade (all < 70/100)."
-
-                if not perform_retry and self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None):
-                    # Fallback to overall grade if not an image batch retry or if image batch passed but code failed
-                    if overall_grade < 70:
-                        perform_retry = True
-                        retry_reason_message = f"⚠️ Overall grade ({overall_grade}/100) is below 70."
-
-                # Yield current overall grade before retry decision
-                if self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None):
-                     yield {"type": "system", "content": f"📊 Overall Grade: {overall_grade}/100 (Code: {critic_grade or 'N/A'}, Art: {art_grade_display})"}
-
-
-                if perform_retry and self.current_attempt < self.max_retry_attempts:
-                    yield {"type": "system", "content": f"{retry_reason_message} Requesting Main Coder to improve... (Attempt {self.current_attempt + 1}/{self.max_retry_attempts})"}
-
-                    art_critique_summary_for_retry = "No specific art critiques available for this attempt.\n"
-                    if all_art_critiques:
-                        art_critique_summary_for_retry = "Summary of Art Critiques (focus on best image if applicable):\n"
-                        if best_image_details: # best_image_details would have the highest grade
-                            art_critique_summary_for_retry += (f"Best Image ({os.path.basename(best_image_details['image_path'])}, "
-                                                               f"Grade: {best_image_details['grade'] or 'N/A'}):\n"
-                                                               f"{best_image_details['critique_text'][:400]}...\n\n")
-                        # Add summaries of other images if they also failed, or refer to chat.
-                        other_failing_critiques = [c for c in all_art_critiques if c.get('grade', 0) < 70 and c != best_image_details]
-                        if other_failing_critiques:
-                            art_critique_summary_for_retry += "Other critiques for images needing improvement:\n"
-                            for c_item in other_failing_critiques[:2]: # Limit to avoid overly long prompts
-                                art_critique_summary_for_retry += f"- {os.path.basename(c_item['image_path'])} (Grade: {c_item['grade']}): {c_item['critique_text'][:200]}...\n"
-                        elif len(all_art_critiques) > 1 and best_image_details and best_image_details.get('grade', 0) >=70 :
-                             art_critique_summary_for_retry += "The best image was acceptable, but other aspects of the request or code may need improvement if overall grade is low.\n"
-                        elif not best_image_details and all_art_critiques:
-                            art_critique_summary_for_retry = "Multiple art critiques provided. Please review them in the chat history.\n"
-
-
-                    retry_intro = (f"RETRY (Original User Prompt: '{original_user_prompt}'):\n\n"
-                                   f"PREVIOUS ATTEMPT FEEDBACK:\n"
-                                   f"Code Critic Grade: {critic_grade or 'N/A'}\n"
-                                   f"Art Critic Best Image Grade: {art_grade_display}\n"
-                                   f"Overall Grade: {overall_grade}/100\n"
-                                   f"{retry_reason_message}\n\n"
-                                   f"Please improve the implementation based on the critique feedback above. "
-                                   f"Focus on addressing issues in both code and image generation (if applicable).\n\n"
-                                   f"Art Critiques Summary:\n{art_critique_summary_for_retry.strip()}")
-                    current_main_coder_prompt = f"{retry_intro}\n\n{enhanced_user_prompt}"
-                    continue  # Retry with improved prompt
-
-                elif perform_retry: # Max attempts reached
-                    yield {"type": "system", "content": f"⚠️ Maximum attempts reached. {retry_reason_message} Final overall grade: {overall_grade}/100"}
-
-                elif self.grading_enabled and (critic_grade is not None or final_art_grade_for_overall_calc is not None) and overall_grade >=70: # Explicitly check for passing overall grade
-                    yield {"type": "system", "content": f"✅ Grade acceptable ({overall_grade}/100). Implementation approved!"}
-
-                elif not self.grading_enabled: # If grading is disabled, and we didn't hit an error or other retry.
-                     yield {"type": "system", "content": "✅ Processing complete (grading disabled)."}
-
-                # --- Loser Image Handling ---
-                paths_to_trash_this_attempt = []
-                if generated_image_paths_batch:
-                    best_image_path_final = best_image_details.get('image_path') if best_image_details else None
-                    best_image_grade_final = best_image_details.get('grade', -1) if best_image_details else -1
-
-                    if perform_retry: # Current attempt is being discarded, trash ALL generated images for this attempt
-                        paths_to_trash_this_attempt.extend(generated_image_paths_batch)
-                        yield {"type": "system", "content": f"🗑️ Discarding all {len(generated_image_paths_batch)} images from this attempt due to retry."}
-                    else: # This is the final attempt for this interaction (either success or max retries reached)
-                        if best_image_path_final and best_image_grade_final >= 70:
-                            # A best image was selected and it passed
-                            for img_path in generated_image_paths_batch:
-                                if img_path != best_image_path_final:
-                                    paths_to_trash_this_attempt.append(img_path)
-                            if paths_to_trash_this_attempt:
-                                yield {"type": "system", "content": f"🗑️ Keeping best image '{os.path.basename(best_image_path_final)}'. Trashing {len(paths_to_trash_this_attempt)} other variants."}
-                        else:
-                            # No best image passed, or no best image was selected on this final attempt
-                            paths_to_trash_this_attempt.extend(generated_image_paths_batch)
-                            if generated_image_paths_batch: # Only message if there were images
-                                yield {"type": "system", "content": f"🗑️ No single best image met criteria on final attempt. Trashing all {len(generated_image_paths_batch)} generated images."}
-
-                if paths_to_trash_this_attempt:
-                    unique_paths_to_trash = list(set(paths_to_trash_this_attempt))
-                    if unique_paths_to_trash: # Ensure there's something to trash after unique
-                        trash_path_display = Path(VM_DIR) / TRASH_DIR_NAME
-                        yield {"type": "system", "content": f"ℹ️ Moving {len(unique_paths_to_trash)} non-selected/failed image(s) to the '{trash_path_display}' folder..."}
-                        move_log_messages = self._move_to_trash(unique_paths_to_trash)
-                        for log_msg in move_log_messages:
-                            yield {"type": "system", "content": log_msg}
-                # --- End Loser Image Handling ---
-
-                # Phase 4: Collaborative Refinement (only if agents were involved and refinement needed)
-                if (should_use_critic or should_use_art_critic) and self._needs_refinement(implementation_results):
-                    yield {"type": "system", "content": "🔄 Agents collaborating on final refinements..."}
-                    refinement_suggestions = self._get_collaborative_refinement()
-                    if refinement_suggestions:
-                        yield {"type": "agent", "agent": "🤝 Collaborative", "content": refinement_suggestions}
-
-                yield {"type": "system", "content": "✅ Multi-agent analysis complete!"}
-                break  # Exit retry loop on successful completion
+                    break # Successful completion or max retries reached without explicit success
 
             except Exception as e:
                 error_msg = f"Enhanced Agent System Error: {e}"
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": error_msg}
-                break  # Exit on system errors
+                for agent_status_msg_type in ["prompt_enhancer", "art_critic_proactive", "main_coder", "code_critic", "art_critic"]:
+                    yield {"type": "agent_status_update", "agent": agent_status_msg_type, "status": "inactive"}
+                break
 
     def _get_code_critique(self, user_prompt, main_response, implementation_results):
         """Get enhanced code critique"""
@@ -1343,6 +1343,12 @@ class EnhancedGeminiIDE(tk.Tk):
         self.current_image = None
         self.current_open_file_path = None
 
+        # Debouncing variables
+        self._debounce_refresh_id = None
+        self._debounce_insights_id = None
+        self._save_timer = None # Ensure _save_timer is initialized
+        self._debounce_interval = 300  # milliseconds
+
         self._create_enhanced_menu()
         self._create_enhanced_layout()
         self._create_enhanced_status_bar()
@@ -1396,23 +1402,19 @@ class EnhancedGeminiIDE(tk.Tk):
 
         self.config(menu=menubar)
 
-    def _create_enhanced_layout(self):
-        """Create enhanced UI layout"""
-        main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        # Left panel with enhanced features
-        left_frame = ttk.Frame(main_pane)
-        main_pane.add(left_frame, weight=1)
+    def _setup_left_panel(self, parent_pane):
+        """Sets up the left panel with image preview and file tree."""
+        left_frame = ttk.Frame(parent_pane)
+        parent_pane.add(left_frame, weight=1)
 
         # Enhanced image preview
         img_frame = ttk.LabelFrame(left_frame, text="🖼️ Visual Preview", padding=5)
         img_frame.pack(fill=tk.X, pady=(0, 5))
         
-        self.canvas = tk.Canvas(img_frame, bg=self.bg_color_medium, height=320, highlightthickness=0) # Use defined color
+        self.canvas = tk.Canvas(img_frame, bg=self.bg_color_medium, height=320, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.create_text(160, 160, text="🖼️ No image selected\nImages will be analyzed by Art Critic",
-                               fill=self.fg_color_light, font=("Arial", 11), justify=tk.CENTER) # Use defined color
+                               fill=self.fg_color_light, font=("Arial", 11), justify=tk.CENTER)
 
         # Enhanced file tree
         tree_frame = ttk.LabelFrame(left_frame, text="📁 Project Explorer", padding=5)
@@ -1424,7 +1426,6 @@ class EnhancedGeminiIDE(tk.Tk):
         self.tree.column("fullpath", width=0, stretch=False)
         self.tree.column("size", width=80)
 
-        # Scrollbars for tree
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -1437,10 +1438,12 @@ class EnhancedGeminiIDE(tk.Tk):
 
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
         self._attach_enhanced_tree_context_menu()
+        return left_frame
 
-        # Right panel with enhanced notebook
-        right_frame = ttk.Frame(main_pane)
-        main_pane.add(right_frame, weight=3)
+    def _setup_right_panel(self, parent_pane):
+        """Sets up the right panel with the notebook for editor, chat, and insights."""
+        right_frame = ttk.Frame(parent_pane)
+        parent_pane.add(right_frame, weight=3)
 
         self.notebook = ttk.Notebook(right_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
@@ -1448,40 +1451,20 @@ class EnhancedGeminiIDE(tk.Tk):
         # Enhanced editor tab
         editor_frame = ttk.Frame(self.notebook)
         self.editor = scrolledtext.ScrolledText(
-            editor_frame, 
-            wrap=tk.WORD, 
-            font=("Consolas", 12),
-            padx=15,
-            pady=15,
-            bg=self.bg_color_medium, # Use defined color "#1e1e1e" is very dark
-            fg=self.fg_color_light,
-            insertbackground=self.fg_color_light, # Cursor color
-            relief=tk.FLAT,
-            borderwidth=0,
-            highlightthickness=1, # Add a subtle border
-            highlightbackground=self.border_color
+            editor_frame, wrap=tk.WORD, font=("Consolas", 12), padx=15, pady=15,
+            bg=self.bg_color_medium, fg=self.fg_color_light, insertbackground=self.fg_color_light,
+            relief=tk.FLAT, borderwidth=0, highlightthickness=1, highlightbackground=self.border_color
         )
         self.editor.pack(fill=tk.BOTH, expand=True)
-        # ScrolledText frame background - it's a tk.Frame
         self.editor.frame.config(background=self.bg_color_dark)
         self.notebook.add(editor_frame, text="📝 Code Editor")
 
         # Enhanced multi-agent chat tab
         chat_frame = ttk.Frame(self.notebook)
         self.chat = scrolledtext.ScrolledText(
-            chat_frame, 
-            wrap=tk.WORD, 
-            font=("Segoe UI", 11),
-            padx=15,
-            pady=15,
-            state="disabled",
-            bg=self.bg_color_medium, # Use defined color
-            fg=self.fg_color_light,   # Use defined color
-            insertbackground=self.fg_color_light, # Cursor color (though state is disabled)
-            relief=tk.FLAT,
-            borderwidth=0,
-            highlightthickness=1, # Add a subtle border
-            highlightbackground=self.border_color
+            chat_frame, wrap=tk.WORD, font=("Segoe UI", 11), padx=15, pady=15, state="disabled",
+            bg=self.bg_color_medium, fg=self.fg_color_light, insertbackground=self.fg_color_light,
+            relief=tk.FLAT, borderwidth=0, highlightthickness=1, highlightbackground=self.border_color
         )
         self.chat.pack(fill=tk.BOTH, expand=True)
         self.chat.frame.config(background=self.bg_color_dark)
@@ -1490,43 +1473,25 @@ class EnhancedGeminiIDE(tk.Tk):
         # Project insights tab
         insights_frame = ttk.Frame(self.notebook)
         self.insights = scrolledtext.ScrolledText(
-            insights_frame,
-            wrap=tk.WORD,
-            font=("Segoe UI", 10),
-            padx=15,
-            pady=15,
-            state="disabled",
-            bg=self.bg_color_medium, # Use defined color
-            fg=self.fg_color_light,
-            relief=tk.FLAT,
-            borderwidth=0,
-            highlightthickness=1, # Add a subtle border
-            highlightbackground=self.border_color
+            insights_frame, wrap=tk.WORD, font=("Segoe UI", 10), padx=15, pady=15, state="disabled",
+            bg=self.bg_color_medium, fg=self.fg_color_light, relief=tk.FLAT, borderwidth=0,
+            highlightthickness=1, highlightbackground=self.border_color
         )
         self.insights.pack(fill=tk.BOTH, expand=True)
         self.insights.frame.config(background=self.bg_color_dark)
         self.notebook.add(insights_frame, text="📊 Project Insights")
+        return right_frame
 
-        # Enhanced input area
-        input_frame = ttk.Frame(right_frame)
+    def _setup_input_area(self, parent_frame):
+        """Sets up the input text area and control buttons."""
+        input_frame = ttk.Frame(parent_frame)
         input_frame.pack(fill=tk.X, pady=(0, 5))
 
-        # Input text with placeholder
         self.input_txt = tk.Text(
-            input_frame, 
-            height=4, 
-            wrap=tk.WORD,
-            font=("Segoe UI", 11),
-            padx=10,
-            pady=10,
-            bg=self.bg_color_medium, # Use defined color
-            fg=self.fg_color_light,    # Use defined color
-            insertbackground=self.fg_color_light, # Cursor color
-            relief=tk.FLAT,
-            borderwidth=1, # Small border
-            highlightbackground=self.border_color, # Border when not focused
-            highlightcolor=self.accent_color,    # Border when focused
-            highlightthickness=1
+            input_frame, height=4, wrap=tk.WORD, font=("Segoe UI", 11), padx=10, pady=10,
+            bg=self.bg_color_medium, fg=self.fg_color_light, insertbackground=self.fg_color_light,
+            relief=tk.FLAT, borderwidth=1, highlightbackground=self.border_color,
+            highlightcolor=self.accent_color, highlightthickness=1
         )
         self.input_txt.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         self.input_txt.bind("<Control-Return>", lambda e: self.send_enhanced_prompt())
@@ -1534,47 +1499,50 @@ class EnhancedGeminiIDE(tk.Tk):
         self.input_txt.bind("<FocusIn>", self._clear_placeholder)
         self.input_txt.bind("<FocusOut>", self._restore_placeholder)
 
-        # Frame for control buttons (toggle, screenshot, send)
         control_button_frame = ttk.Frame(input_frame)
-        control_button_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0)) # Use fill=tk.Y and anchor
+        control_button_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
 
-        # Label for the toggle switch
         self.enhancer_toggle_label = ttk.Label(control_button_frame, text="Enhancer:")
         self.enhancer_toggle_label.pack(side=tk.LEFT, padx=(0, 2), anchor='center')
 
-        # Custom Toggle Switch Canvas
         self.enhancer_toggle_switch = tk.Canvas(
-            control_button_frame,
-            width=50,
-            height=22,
-            borderwidth=0, # Using 0 and drawing own border if needed
-            relief=tk.FLAT,
-            cursor="hand2"
+            control_button_frame, width=50, height=22, borderwidth=0, relief=tk.FLAT, cursor="hand2"
         )
-        self.enhancer_toggle_switch.pack(side=tk.LEFT, padx=(0, 8), anchor='center') # Added more padding
+        self.enhancer_toggle_switch.pack(side=tk.LEFT, padx=(0, 8), anchor='center')
 
-        # Screenshot upload button (now icon-only for compactness)
-        self.screenshot_btn = ttk.Button(
-            control_button_frame,
-            text="📸",
-            command=self.upload_screenshot,
-            width=3
-        )
-        self.screenshot_btn.pack(side=tk.LEFT, padx=(0, 3), anchor='center') # Adjusted padding
+        self.screenshot_btn = ttk.Button(control_button_frame, text="📸", command=self.upload_screenshot, width=3)
+        self.screenshot_btn.pack(side=tk.LEFT, padx=(0, 3), anchor='center')
         
-        # Enhanced send button
-        self.send_btn = ttk.Button(
-            control_button_frame,
-            text="🚀 Send",
-            command=self.send_enhanced_prompt
-        )
+        self.send_btn = ttk.Button(control_button_frame, text="🚀 Send", command=self.send_enhanced_prompt)
         self.send_btn.pack(side=tk.LEFT, anchor='center')
         self.enhancer_toggle_switch.bind("<Button-1>", self._toggle_prompt_enhancer)
+
+
+    def _create_enhanced_layout(self):
+        """Create enhanced UI layout"""
+        main_pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self._setup_left_panel(main_pane)
+        right_frame = self._setup_right_panel(main_pane) # right_frame is parent for input_area
+        self._setup_input_area(right_frame) # Input area is part of the right_frame, not the notebook
 
         self.editor.bind("<Control-s>", lambda e: self.save_current_file())
         self._setup_enhanced_syntax_highlighting()
         self.editor.bind("<KeyRelease>", self._on_editor_key_release)
-        self.refresh_files()
+        self._schedule_refresh_files() # Initial refresh
+
+    def _schedule_refresh_files(self):
+        """Debounces the refresh_files call."""
+        if self._debounce_refresh_id:
+            self.after_cancel(self._debounce_refresh_id)
+        self._debounce_refresh_id = self.after(self._debounce_interval, self.refresh_files)
+
+    def _schedule_update_insights(self):
+        """Debounces the update_agent_insights call."""
+        if self._debounce_insights_id:
+            self.after_cancel(self._debounce_insights_id)
+        self._debounce_insights_id = self.after(self._debounce_interval, self.update_agent_insights)
 
     def _setup_enhanced_syntax_highlighting(self):
         """Enhanced syntax highlighting"""
@@ -1597,8 +1565,8 @@ class EnhancedGeminiIDE(tk.Tk):
             "operator": r"[+\-*/=<>!&|^~%]"
         }
 
-    def _apply_enhanced_syntax_highlighting(self):
-        """Apply enhanced syntax highlighting"""
+    def _apply_full_syntax_highlighting(self): # Renamed here
+        """Apply full syntax highlighting to the entire document."""
         content = self.editor.get("1.0", tk.END)
 
         for tag in self.syntax_patterns.keys():
@@ -1609,9 +1577,59 @@ class EnhancedGeminiIDE(tk.Tk):
                 start, end = match.span()
                 self.editor.tag_add(tag, f"1.0+{start}c", f"1.0+{end}c")
 
+    def _apply_optimized_syntax_highlighting(self, event=None):
+        """Apply syntax highlighting only to a range of lines around the edit."""
+        try:
+            current_pos = self.editor.index(tk.INSERT)
+            current_line = int(current_pos.split('.')[0])
+
+            # Define the range of lines to highlight (e.g., 10 lines above and below)
+            start_line = max(1, current_line - 10)
+            # Ensure end_line does not exceed the document's last line
+            last_doc_line_str = self.editor.index(f"{tk.END}-1c").split('.')[0] # Get "line.char" then "line"
+            last_doc_line = int(last_doc_line_str) if last_doc_line_str.isdigit() else 1 # Handle empty or non-numeric doc case
+
+            end_line = min(last_doc_line, current_line + 10)
+
+            # Ensure start_line is not greater than end_line, can happen if last_doc_line is small
+            if start_line > end_line:
+                start_line = end_line
+
+            start_index = f"{start_line}.0"
+            end_index = f"{end_line}.end"
+
+            # Get the content for this specific range
+            content_to_highlight = self.editor.get(start_index, end_index)
+            if not content_to_highlight: # Nothing to do if the range is empty
+                return
+
+            # Remove old tags only from this range
+            for tag_key in self.syntax_patterns.keys(): # Use a consistent variable name like tag_key or pattern_name
+                self.editor.tag_remove(tag_key, start_index, end_index)
+
+            # Apply patterns to the extracted content
+            for tag_key, pattern in self.syntax_patterns.items():
+                for match in re.finditer(pattern, content_to_highlight, re.MULTILINE | re.DOTALL):
+                    match_start_offset, match_end_offset = match.span()
+
+                    # Calculate absolute document indices for the match
+                    abs_match_start = self.editor.index(f"{start_index} + {match_start_offset} chars")
+                    abs_match_end = self.editor.index(f"{start_index} + {match_end_offset} chars")
+
+                    self.editor.tag_add(tag_key, abs_match_start, abs_match_end)
+        except Exception:
+            # Optional: log this error, but don't let it crash the app
+            # print(f"Error in optimized syntax highlighting: {e}")
+            # Fallback to full highlighting in case of error during optimized highlighting
+            self._apply_full_syntax_highlighting()
+            pass
+
+
     def _on_editor_key_release(self, event=None):
         """Enhanced editor key release handler"""
-        self._apply_enhanced_syntax_highlighting()
+        # Use optimized highlighting for key releases
+        self._apply_optimized_syntax_highlighting()
+
         # Auto-save after 2 seconds of inactivity
         if hasattr(self, '_save_timer'):
             self.after_cancel(self._save_timer)
@@ -1739,9 +1757,10 @@ class EnhancedGeminiIDE(tk.Tk):
         self.status_var.set("🔄 Enhanced Multi-Agent System Processing...")
 
         # Update agent status to processing
-        self.main_status.config(foreground=self.agent_status_active_color)
-        self.critic_status.config(foreground=self.agent_status_active_color)
-        self.art_status.config(foreground=self.agent_status_active_color)
+                    # self.main_status.config(foreground=self.agent_status_active_color)
+                    # self.critic_status.config(foreground=self.agent_status_active_color)
+                    # self.art_status.config(foreground=self.agent_status_active_color)
+                    # Initial status update will be handled by the agent_status_update message type
 
         threading.Thread(
             target=self._process_enhanced_prompt, 
@@ -1760,49 +1779,8 @@ class EnhancedGeminiIDE(tk.Tk):
             self.msg_queue.put(response)
         self.msg_queue.put({"type": "done"})
 
-    def _process_messages(self):
-        """Enhanced message processing"""
-        try:
-            while not self.msg_queue.empty():
-                msg = self.msg_queue.get_nowait()
-
-                if msg["type"] == "agent":
-                    agent_name = msg["agent"]
-                    agent_colors = {
-                        "🤖 Main Coder": "#2E8B57",
-                        "📊 Code Critic": "#FF6347",
-                        "🎭 Art Critic": "#9370DB",
-                        "✨ Prompt Enhancer": "#FFD700", # Gold color for enhancer
-                        "🤝 Collaborative": "#4169E1"
-                    }
-                    color = agent_colors.get(agent_name, "#000000")
-                    self.add_chat_message(agent_name, msg["content"], color)
-                elif msg["type"] == "system":
-                    self.add_chat_message("🔧 System", msg["content"], "#2E8B57")
-                elif msg["type"] == "error":
-                    self.add_chat_message("❌ Error", msg["content"], "#ff0000")
-                elif msg["type"] == "file_changed":
-                    self.refresh_files()
-                    self.update_agent_insights()
-                    changed_file_path = Path(msg["content"])
-                    if changed_file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
-                        self.display_enhanced_image(changed_file_path)
-                    elif self.current_open_file_path and self.current_open_file_path.samefile(changed_file_path):
-                        self.display_file(self.current_open_file_path)
-                elif msg["type"] == "done":
-                    self.input_txt.config(state="normal")
-                    self.send_btn.config(state="normal")
-                    self.screenshot_btn.config(state="normal") # Re-enable screenshot button
-                    self.status_var.set("✅ Enhanced Multi-Agent System Ready")
-                    # Reset agent status
-                    self.main_status.config(foreground=self.agent_status_inactive_color)
-                    self.critic_status.config(foreground=self.agent_status_inactive_color)
-                    self.art_status.config(foreground=self.agent_status_inactive_color)
-
-        except queue.Empty:
-            pass
-
-        self.after(100, self._process_messages)
+    # This is the older _process_messages method that will be removed.
+    # The newer one is further down, around line 2531.
 
     def display_enhanced_image(self, path):
         """Enhanced image display with metadata"""
@@ -2184,7 +2162,7 @@ class EnhancedGeminiIDE(tk.Tk):
             self.editor.insert("1.0", content)
             self.editor.config(state="normal")
 
-            self._apply_enhanced_syntax_highlighting()
+            self._apply_full_syntax_highlighting() # Changed here
             self.notebook.select(0)  # Switch to editor tab
             
             line_count = len(content.splitlines())
@@ -2213,7 +2191,7 @@ class EnhancedGeminiIDE(tk.Tk):
                 self.status_var.set(f"💾 Saved: {self.current_open_file_path.name} ({line_count} lines, {char_count} chars)")
                 
                 # Update insights
-                self.update_agent_insights()
+                self._schedule_update_insights()
             except Exception as e:
                 self.status_var.set(f"❌ Save error: {str(e)}")
         else:
@@ -2235,10 +2213,10 @@ class EnhancedGeminiIDE(tk.Tk):
                 try:
                     file_path.parent.mkdir(parents=True, exist_ok=True)
                     file_path.touch()
-                    self.refresh_files()
+                    self._schedule_refresh_files()
                     self.display_file(file_path)
                     self.status_var.set(f"✅ Created: {file_name}")
-                    self.update_agent_insights()
+                    self._schedule_update_insights()
                 except Exception as e:
                     self.status_var.set(f"❌ Error: {str(e)}")
 
@@ -2263,9 +2241,9 @@ class EnhancedGeminiIDE(tk.Tk):
                 old_full_path.rename(new_full_path)
                 if self.current_open_file_path and self.current_open_file_path == old_full_path:
                     self.current_open_file_path = new_full_path
-                self.refresh_files()
+                self._schedule_refresh_files()
                 self.status_var.set(f"✅ Renamed: {old_rel_path.name} → {new_name}")
-                self.update_agent_insights()
+                self._schedule_update_insights()
             except Exception as e:
                 self.status_var.set(f"❌ Rename error: {str(e)}")
 
@@ -2295,8 +2273,8 @@ class EnhancedGeminiIDE(tk.Tk):
                     self.editor.delete("1.0", tk.END)
                     self.current_open_file_path = None
 
-                self.refresh_files()
-                self.update_agent_insights()
+                self._schedule_refresh_files()
+                self._schedule_update_insights()
             except Exception as e:
                 self.status_var.set(f"❌ Delete error: {str(e)}")
 
@@ -2468,7 +2446,7 @@ class EnhancedGeminiIDE(tk.Tk):
         """Finalize screenshot processing and add to chat"""
         try:
             # Refresh files and display image
-            self.refresh_files()
+            self._schedule_refresh_files()
             filepath = VM_DIR / filename
             self.display_enhanced_image(filepath)
             
@@ -2512,11 +2490,47 @@ class EnhancedGeminiIDE(tk.Tk):
                 elif msg["type"] == "system":
                     self.add_chat_message("🔧 System", msg["content"], color=self.system_chat_color) # Use defined system color
                 elif msg["type"] == "error":
-                    self.add_chat_message("❌ Error", msg["content"], color=self.error_chat_color) # Use defined error color
+                    error_content = msg.get("content", "An unspecified error occurred.")
+                    self.add_chat_message("❌ Error", error_content, color=self.error_chat_color) # Use defined error color
                     # Set agent icons to error color
                     self.main_status.config(foreground=self.agent_status_error_color)
                     self.critic_status.config(foreground=self.agent_status_error_color)
                     self.art_status.config(foreground=self.agent_status_error_color)
+                    error_summary = str(error_content).split('\n')[0]
+                    self.status_var.set(f"❌ Error: {error_summary[:100]}")
+                elif msg["type"] == "agent_status_update":
+                    agent_name = msg["agent"]
+                    status = msg["status"]
+
+                    agent_display_names = {
+                        "main_coder": "🤖 Main Coder",
+                        "code_critic": "📊 Code Critic",
+                        "art_critic": "🎨 Art Critic",
+                        "art_critic_proactive": "🎨 Art Critic (Proactive)",
+                        "prompt_enhancer": "✨ Prompt Enhancer"
+                    }
+                    display_name = agent_display_names.get(agent_name, agent_name) # Fallback to raw name
+
+                    target_widget = None
+                    if agent_name == "main_coder":
+                        target_widget = self.main_status
+                    elif agent_name == "code_critic":
+                        target_widget = self.critic_status
+                    elif agent_name == "art_critic" or agent_name == "art_critic_proactive":
+                        target_widget = self.art_status
+                    elif agent_name == "prompt_enhancer":
+                        target_widget = self.main_status # Prompt enhancer affects main coder flow
+
+                    if target_widget:
+                        if status == "active":
+                            target_widget.config(foreground=self.agent_status_active_color)
+                            self.status_var.set(f"{display_name} processing...")
+                        elif status == "inactive":
+                            target_widget.config(foreground=self.agent_status_inactive_color)
+                            # Set a generic processing message if the system isn't fully done or in an error state.
+                            # This helps bridge the gap between one agent finishing and another starting, or before the final "done" message.
+                            if not (self.status_var.get().startswith("✅") or self.status_var.get().startswith("❌")):
+                                self.status_var.set("🔄 Enhanced Multi-Agent System processing...")
                 elif msg["type"] == "screenshot_success":
                     filename = msg["content"]
                     self._finalize_screenshot_processing(filename)
@@ -2530,8 +2544,8 @@ class EnhancedGeminiIDE(tk.Tk):
                 elif msg["type"] == "screenshot_info":
                     self.status_var.set(msg["content"])
                 elif msg["type"] == "file_changed":
-                    self.refresh_files()
-                    self.update_agent_insights()
+                    self._schedule_refresh_files()
+                    self._schedule_update_insights()
                     changed_file_path = Path(msg["content"])
                     if changed_file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
                         self.display_enhanced_image(changed_file_path)
@@ -2541,10 +2555,10 @@ class EnhancedGeminiIDE(tk.Tk):
                     self.input_txt.config(state="normal")
                     self.send_btn.config(state="normal")
                     self.status_var.set("✅ Enhanced Multi-Agent System Ready")
-                    # Reset agent status
-                    self.main_status.config(foreground="green")
-                    self.critic_status.config(foreground="green")
-                    self.art_status.config(foreground="green")
+                    # Reset agent status icons (already handled by individual 'inactive' messages from run_enhanced_interaction)
+                    self.main_status.config(foreground=self.agent_status_inactive_color)
+                    self.critic_status.config(foreground=self.agent_status_inactive_color)
+                    self.art_status.config(foreground=self.agent_status_inactive_color)
 
         except queue.Empty:
             pass
@@ -2552,8 +2566,21 @@ class EnhancedGeminiIDE(tk.Tk):
         self.after(100, self._process_messages)
 
     def on_close(self):
-        """Enhanced close handler"""
+        """Enhanced close handler, ensures pending 'after' calls are cancelled."""
         if messagebox.askokcancel("🚪 Exit", "Exit Enhanced Multi-Agent IDE?\n\nUnsaved changes will be lost."):
+            # Cancel any pending debounced calls
+            if self._debounce_refresh_id:
+                self.after_cancel(self._debounce_refresh_id)
+                self._debounce_refresh_id = None
+            if self._debounce_insights_id:
+                self.after_cancel(self._debounce_insights_id)
+                self._debounce_insights_id = None
+
+            # Cancel auto-save timer
+            if hasattr(self, '_save_timer') and self._save_timer: # Check if _save_timer exists and is not None
+                self.after_cancel(self._save_timer)
+                self._save_timer = None
+
             self.destroy()
 
 # -----------------------------------------------------------------------------
