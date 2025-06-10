@@ -43,6 +43,7 @@ You operate in a headless environment with full vision capabilities. You can ana
 - `create_file(path, content)`: Creates a new text file with specified content.
 - `write_to_file(path, content)`: Overwrites an existing text file.
 - `delete_file(path)`: Deletes a file or directory.
+- `rename_file(old_path, new_path)`: Renames a file or directory.
 - `run_command(command)`: Executes a shell command in the project directory.
 - `generate_image(path, prompt)`: Generates an image using AI based on a text prompt.
 
@@ -62,6 +63,7 @@ You operate in a headless environment with full vision capabilities. You can ana
 6. **COLLABORATION**: Work with Code Critic and Art Critic for optimal results.
 7. **QUALITY EXCELLENCE**: Aim for high-quality implementation as critique agents will grade your work.
 8. **IMAGE GENERATION VARIATIONS**: When tasked with generating an image, you MUST generate three distinct variations. For each variation, issue a separate `generate_image(path, prompt)` command. Use unique, descriptive filenames (e.g., `image_v1.png`, `image_v2.png`, `image_v3.png`). If possible, subtly vary the prompts for each of the three images to encourage diversity, while adhering to the core user request and any artistic guidance provided.
+9. **USE RENAME_FILE**: Always use the `rename_file(old_path, new_path)` command for renaming files or directories. Do not use `run_command` with `mv` or `ren` for renaming.
 
 **INTERACTION FLOW:**
 1. Implement user requests through commands with highest quality standards
@@ -234,7 +236,30 @@ class EnhancedMultiAgentSystem:
             "delete_file": self._delete_file,
             "run_command": self._run_command,
             "generate_image": self.generate_image,
+            "rename_file": self._rename_file,
         }
+
+    def _rename_file(self, old_path_str: str, new_path_str: str) -> str:
+        """Renames a file or directory."""
+        old_safe_path = self._safe_path(old_path_str)
+        if not old_safe_path:
+            return f"❌ Invalid old path: {old_path_str}"
+
+        new_safe_path = self._safe_path(new_path_str)
+        if not new_safe_path:
+            return f"❌ Invalid new path: {new_path_str}"
+
+        if not old_safe_path.exists():
+            return f"❌ Source path does not exist: {old_path_str}"
+
+        try:
+            new_safe_path.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(old_safe_path, new_safe_path)
+            return f"✅ Renamed: {old_path_str} to {new_path_str}"
+        except Exception as e:
+            error_msg = f"❌ Error renaming {old_path_str}: {e}"
+            self.error_context.append(error_msg)
+            return error_msg
 
     def _get_enhanced_prompt(self, user_prompt):
         """Calls the PROMPT_ENHANCER_AGENT to refine the user's prompt."""
@@ -733,7 +758,11 @@ Focus on actionable improvements that leverage all three agent perspectives.
 
         # Add current files with content
         if VM_DIR.exists():
-            for root, _, files in os.walk(VM_DIR):
+            for root, dirs, files in os.walk(VM_DIR):
+                # Remove TRASH_DIR_NAME from dirs to prevent traversing it
+                if TRASH_DIR_NAME in dirs:
+                    dirs.remove(TRASH_DIR_NAME)
+
                 for name in sorted(files):
                     rel_path = os.path.relpath(os.path.join(root, name), VM_DIR)
                     file_path = os.path.join(root, name)
@@ -774,7 +803,11 @@ Focus on actionable improvements that leverage all three agent perspectives.
         
         if VM_DIR.exists():
             image_count = 0
-            for root, _, files in os.walk(VM_DIR):
+            for root, dirs, files in os.walk(VM_DIR):
+                # Remove TRASH_DIR_NAME from dirs to prevent traversing it
+                if TRASH_DIR_NAME in dirs:
+                    dirs.remove(TRASH_DIR_NAME)
+
                 for name in files:
                     if name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
                         file_path = os.path.join(root, name)
