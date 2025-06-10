@@ -152,6 +152,10 @@ Rewrite the given user prompt to maximize its effectiveness. Consider the follow
 4.  **Keywords:** Include relevant keywords that the LLM can use to generate a better response.
 5.  **Tone and Style:** Maintain the user's original intent but refine the language to be more effective for AI. For image generation, suggest artistic styles (e.g., "impressionistic style", "cyberpunk aesthetic", "shot on 35mm film").
 6.  **Completeness:** Ensure the prompt contains all necessary information for the AI to perform the task well.
+7.  **Self-Improvement/Meta-Modification Requests:** If the user's prompt is a request for the AI system to improve itself, its own code (e.g., the Python code of this application), or its capabilities, reformulate this into an actionable prompt for a *coding agent*. This enhanced prompt should direct the coding agent to:
+    a. Analyze its current codebase (which it should have access to, particularly files like `gemini_app.py` if mentioned or implied).
+    b. Identify specific areas for improvement based on the user's request (e.g., refactoring for efficiency, adding a new feature, improving error handling, enhancing comments or documentation).
+    c. Implement these improvements by generating commands to modify its own code files. Ensure the prompt specifies which files to modify if known.
 
 **RULES:**
 1.  **CRITICALLY IMPORTANT: OUTPUT ONLY THE ENHANCED PROMPT:** Your response *must exclusively* contain the refined prompt text and nothing else. Do not include any explanations, apologies, conversational filler, or any attempt to answer or execute the user's underlying request. Your job is *only* to improve the prompt for another AI.
@@ -562,48 +566,92 @@ Focus on actionable improvements that leverage all three agent perspectives.
         return False
 
     def _process_enhanced_commands(self, response_text):
-        """Enhanced command processing with better error handling"""
-        command_pattern = re.compile(r'`(.*?)`', re.DOTALL)
+        """Enhanced command processing with a more specific regex, pre-checks, and detailed error logging."""
+        # Regex to find function-like calls: command_name(arguments)
+        # It looks for a valid identifier, followed by '(', any characters (non-greedy), and then ')'
+        # Allows for optional whitespace around the command itself within the backticks.
+        command_pattern = re.compile(r'`\s*([a-zA-Z_][\w\.]*\s*\(.*?\))\s*`', re.DOTALL)
         matches = command_pattern.finditer(response_text)
 
         for match in matches:
-            command_str = match.group(1).strip()
+            command_str = match.group(1).strip() # command_str is now the pure command like "create_file(...)"
+
             if not command_str:
                 continue
 
+            # Pre-check if the command string starts with a known command handler name followed by an opening parenthesis
+            # This helps filter out malformed or unintended matches before attempting ast.parse
+            if not any(command_str.startswith(known_cmd + "(") for known_cmd in self.command_handlers.keys()):
+                # Optionally log this as a skipped potential command if debugging is needed
+                # self.error_context.append(f"Skipped potential command (unknown prefix): '{command_str[:50]}...'")
+                yield {"type": "system", "content": f"ℹ️ Note: Ignoring potential command-like text: `{command_str[:100]}{'...' if len(command_str) > 100 else ''}`"}
+                continue
+
             try:
+                # Attempt to parse the command string as a Python expression (specifically, a function call)
                 parsed_expr = ast.parse(command_str, mode="eval")
                 call_node = parsed_expr.body
                 
+                # Ensure it's a Call node (function call)
                 if not isinstance(call_node, ast.Call):
+                    # This should ideally be caught by the regex, but as a safeguard:
+                    self.error_context.append(f"Command parsing error: Not a function call - '{command_str}'")
+                    yield {"type": "error", "content": f"❌ Command error: Not a function call - `{command_str}`"}
                     continue
 
                 func_name = call_node.func.id
                 if func_name not in self.command_handlers:
-                    yield {"type": "error", "content": f"Unknown command: {func_name}"}
+                    self.error_context.append(f"Unknown command: '{func_name}' in '{command_str}'")
+                    yield {"type": "error", "content": f"❌ Unknown command: `{func_name}`"}
                     continue
 
-                args = [ast.literal_eval(arg) for arg in call_node.args]
-                result = self.command_handlers[func_name](*args)
+                # Safely evaluate arguments
+                args = []
+                for arg_node in call_node.args:
+                    try:
+                        args.append(ast.literal_eval(arg_node))
+                    except ValueError as ve:
+                        # Handle cases where an argument is not a simple literal (e.g., a variable or complex expression)
+                        # For now, we'll log and skip this command as it's not supported by literal_eval
+                        error_msg = f"Command argument error: Non-literal argument in '{command_str}'. Argument: {ast.dump(arg_node)}. Error: {ve}"
+                        self.error_context.append(error_msg)
+                        yield {"type": "error", "content": f"❌ Command error: Invalid argument in `{command_str}`"}
+                        break  # Break from processing args for this command
+                else: # This 'else' belongs to the for loop, executed if the loop completed without a 'break'
+                    result = self.command_handlers[func_name](*args)
 
-                if func_name == "generate_image":
-                    for update in result:
-                        yield update
-                else:
-                    yield {"type": "system", "content": result}
-                    
-                # Track successful changes
-                if func_name in ["create_file", "write_to_file", "generate_image"]:
-                    self.project_context["recent_changes"].append({
-                        "command": func_name,
-                        "args": args,
-                        "timestamp": time.time()
-                    })
+                    if func_name == "generate_image":
+                        for update in result: # generate_image is a generator
+                            yield update
+                    else:
+                        yield {"type": "system", "content": result}
 
-            except Exception as e:
-                error_msg = f"Command execution error: '{command_str}' - {e}"
+                    # Track successful changes
+                    if func_name in ["create_file", "write_to_file", "generate_image"]:
+                        self.project_context["recent_changes"].append({
+                            "command": func_name,
+                            "args": args, # Log sanitized args
+                            "timestamp": time.time()
+                        })
+                    continue # Move to the next matched command
+
+                # If the for loop for args was broken (due to bad arg), skip to next command match
+                if args and isinstance(args[-1], Exception): # Check if loop was broken by an error
+                     continue
+
+
+            except SyntaxError as se:
+                error_msg = f"Command syntax error: Unable to parse '{command_str}'. Error: {se}"
                 self.error_context.append(error_msg)
-                yield {"type": "error", "content": error_msg}
+                yield {"type": "error", "content": f"❌ Command syntax error: `{command_str}`"}
+            except ValueError as ve: # Catches errors from ast.literal_eval if the whole command_str was somehow evaluated
+                error_msg = f"Command value error: Problem with argument values in '{command_str}'. Error: {ve}"
+                self.error_context.append(error_msg)
+                yield {"type": "error", "content": f"❌ Command value error: `{command_str}`"}
+            except Exception as e: # General catch-all for other unexpected errors
+                error_msg = f"Unexpected command execution error for '{command_str}'. Error: {type(e).__name__} - {e}"
+                self.error_context.append(error_msg)
+                yield {"type": "error", "content": f"❌ Unexpected error processing command: `{command_str}`"}
 
     def _log_interaction(self, role, content):
         """Logs an interaction to the conversation history, maintaining a manageable length."""
