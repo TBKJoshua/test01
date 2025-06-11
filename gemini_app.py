@@ -262,29 +262,43 @@ class EnhancedMultiAgentSystem:
             return error_msg
 
     def _get_enhanced_prompt(self, user_prompt):
-        """Calls the PROMPT_ENHANCER_AGENT to refine the user's prompt."""
+        """Calls the PROMPT_ENHANCER_AGENT to refine the user's prompt and streams the response."""
         try:
             prompt_parts = [{"text": f"{PROMPT_ENHANCER_AGENT_PROMPT}\n\n{user_prompt}"}]
-            enhanced_response = self.client.models.generate_content(
+            response_stream = self.client.models.generate_content_stream(
                 model=TEXT_MODEL_NAME,
                 contents=prompt_parts
             )
-            self._log_interaction("prompt_enhancer", enhanced_response.text)
-            return enhanced_response.text
+            for chunk in response_stream:
+                yield chunk.text
         except Exception as e:
             self.error_context.append(f"Prompt Enhancer Error: {e}")
-            # Fallback to original prompt if enhancer fails
-            return user_prompt
+            # Fallback to original prompt if enhancer fails (as a single yield)
+            yield user_prompt
 
     def _handle_prompt_enhancement(self, original_user_prompt):
-        """Handles the prompt enhancement phase."""
+        """Handles the prompt enhancement phase, consuming the stream."""
         if self.prompt_enhancer_enabled:
             yield {"type": "system", "content": "✨ Enhancing prompt..."}
             yield {"type": "agent_status_update", "agent": "prompt_enhancer", "status": "active"}
-            enhanced_user_prompt = self._get_enhanced_prompt(original_user_prompt)
+
+            enhanced_prompt_chunks = []
+            full_enhanced_prompt = ""
+            try:
+                for chunk_text in self._get_enhanced_prompt(original_user_prompt):
+                    enhanced_prompt_chunks.append(chunk_text)
+                    yield {"type": "agent_stream_chunk", "agent": "✨ Prompt Enhancer", "content": chunk_text}
+                full_enhanced_prompt = "".join(enhanced_prompt_chunks)
+            except Exception as e:
+                # Error already logged by _get_enhanced_prompt, here we ensure fallback
+                full_enhanced_prompt = original_user_prompt
+                yield {"type": "error", "content": f"Prompt Enhancer stream failed, falling back: {e}"}
+
+
+            self._log_interaction("prompt_enhancer", full_enhanced_prompt) # Log the complete text
             yield {"type": "agent_status_update", "agent": "prompt_enhancer", "status": "inactive"}
-            yield {"type": "agent", "agent": "✨ Prompt Enhancer", "content": enhanced_user_prompt}
-            return enhanced_user_prompt
+            # Removed: yield {"type": "agent", "agent": "✨ Prompt Enhancer", "content": full_enhanced_prompt}
+            return full_enhanced_prompt
         else:
             yield {"type": "system", "content": "✨ Prompt enhancer disabled. Using original prompt."}
             return original_user_prompt
@@ -295,17 +309,33 @@ class EnhancedMultiAgentSystem:
         if self._should_invoke_art_critic(enhanced_user_prompt, "", [], mode="proactive"):
             yield {"type": "system", "content": "🎨 Art Critic providing initial guidance..."}
             yield {"type": "agent_status_update", "agent": "art_critic_proactive", "status": "active"}
+
+            proactive_art_advice_chunks = []
+            full_proactive_art_advice = ""
             try:
                 if hasattr(self, "_get_proactive_art_guidance"):
-                    proactive_art_advice = self._get_proactive_art_guidance(enhanced_user_prompt)
-                    if proactive_art_advice:
-                        yield {"type": "agent", "agent": "🎨 Art Critic (Proactive)", "content": proactive_art_advice}
+                    for chunk_text in self._get_proactive_art_guidance(enhanced_user_prompt):
+                        proactive_art_advice_chunks.append(chunk_text)
+                        yield {"type": "agent_stream_chunk", "agent": "🎨 Art Critic (Proactive)", "content": chunk_text}
+                    full_proactive_art_advice = "".join(proactive_art_advice_chunks)
+
+                    # Logging is handled by _get_proactive_art_guidance itself after stream completion
+                    if full_proactive_art_advice and full_proactive_art_advice.startswith("Error generating proactive art guidance"):
+                         yield {"type": "error", "content": f"Proactive Art Critic failed: {full_proactive_art_advice}"}
+                    # The full message yield is removed as per instructions.
                 else:
                     yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented."}
+                    full_proactive_art_advice = "Proactive art guidance method not implemented." # for return value
             except AttributeError:
-                yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented (AttributeError)."}
+                 yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented (AttributeError)."}
+                 full_proactive_art_advice = "Proactive art guidance method not implemented (AttributeError)." # for return value
+            except Exception as e:
+                full_proactive_art_advice = f"Error processing proactive art guidance stream: {e}"
+                self._log_interaction("proactive_art_critic", full_proactive_art_advice) # Log error
+                yield {"type": "error", "content": full_proactive_art_advice}
             finally:
                 yield {"type": "agent_status_update", "agent": "art_critic_proactive", "status": "inactive"}
+            proactive_art_advice = full_proactive_art_advice # Set the return value
         return proactive_art_advice
 
     def _execute_main_coder_phase(self, current_main_coder_prompt, proactive_art_advice, attempt_suffix):
@@ -319,31 +349,43 @@ class EnhancedMultiAgentSystem:
             proactive_art_advice=proactive_art_advice
         )
 
-        main_response = self.client.models.generate_content(
+        main_response_stream = self.client.models.generate_content_stream(
             model=TEXT_MODEL_NAME,
             contents=main_prompt_parts
         )
+
+        accumulated_main_response_text = ""
+        for chunk in main_response_stream:
+            if chunk.text: # Ensure there's text content
+                accumulated_main_response_text += chunk.text
+                yield {"type": "agent_stream_chunk", "agent": "🤖 Main Coder", "content": chunk.text}
+
         yield {"type": "agent_status_update", "agent": "main_coder", "status": "inactive"}
 
-        self._log_interaction("user", current_main_coder_prompt)
-        self._log_interaction("main_coder", main_response.text)
+        self._log_interaction("user", current_main_coder_prompt) # Log original prompt
+        self._log_interaction("main_coder", accumulated_main_response_text) # Log accumulated response
 
-        yield {"type": "agent", "agent": "🤖 Main Coder", "content": main_response.text}
+        # Yield the full response as one message after streaming, for non-streaming consumers or display
+        # yield {"type": "agent", "agent": "🤖 Main Coder", "content": accumulated_main_response_text} # This might be redundant if chat display handles chunks
 
-        if main_response.text.count("`generate_image(") >= 2:
+        if accumulated_main_response_text.count("`generate_image(") >= 2:
             yield {"type": "system", "content": "ℹ️ Main Coder is generating multiple image variations..."}
 
         implementation_results = []
         generated_image_paths_batch = []
-        for result in self._process_enhanced_commands(main_response.text):
+        for result in self._process_enhanced_commands(accumulated_main_response_text): # Use accumulated text
             implementation_results.append(result)
             yield result
             if result.get("type") == "file_changed":
                 file_path_str = result.get("content", "")
                 if file_path_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                    if Path(file_path_str).parent.name == VM_DIR.name or Path(file_path_str).parent.parent.name == VM_DIR.name:
-                        generated_image_paths_batch.append(file_path_str)
-        return main_response.text, implementation_results, generated_image_paths_batch
+                    # Ensure the path is within the VM_DIR for safety, before appending
+                    safe_file_path = self._safe_path(Path(file_path_str).name) # Check against base name if path is complex
+                    if safe_file_path and Path(file_path_str).parent.name == VM_DIR.name or \
+                       (Path(file_path_str).parent.parent.name == VM_DIR.name if Path(file_path_str).parent.name else False): # Handle cases like vm/subdir/img.png
+                        generated_image_paths_batch.append(str(Path(VM_DIR) / Path(file_path_str).relative_to(VM_DIR))) # Store a clean, project-relative path
+
+        return accumulated_main_response_text, implementation_results, generated_image_paths_batch
 
     def _perform_critic_evaluations(self, original_user_prompt, main_response_text, implementation_results, generated_image_paths_batch):
         """Performs evaluations by Code Critic and Art Critic."""
@@ -359,11 +401,27 @@ class EnhancedMultiAgentSystem:
         if should_use_critic and self.grading_enabled:
             yield {"type": "system", "content": "🔍 Code Critic Agent performing deep analysis and grading..."}
             yield {"type": "agent_status_update", "agent": "code_critic", "status": "active"}
-            critic_analysis = self._get_code_critique(original_user_prompt, main_response_text, implementation_results)
+
+            critic_analysis_chunks = []
+            full_critic_analysis = ""
+            try:
+                for chunk_text in self._get_code_critique(original_user_prompt, main_response_text, implementation_results):
+                    critic_analysis_chunks.append(chunk_text)
+                    yield {"type": "agent_stream_chunk", "agent": "📊 Code Critic", "content": chunk_text}
+                full_critic_analysis = "".join(critic_analysis_chunks)
+                self._log_interaction("code_critic", full_critic_analysis) # Log complete text
+            except Exception as e:
+                full_critic_analysis = f"Error processing code critique stream: {e}"
+                self._log_interaction("code_critic", full_critic_analysis) # Log error
+                # No need to append to self.error_context here as _get_code_critique already does
+
             yield {"type": "agent_status_update", "agent": "code_critic", "status": "inactive"}
-            if critic_analysis:
-                yield {"type": "agent", "agent": "📊 Code Critic", "content": critic_analysis}
-                critic_grade = self._extract_grade(critic_analysis)
+            if full_critic_analysis and not full_critic_analysis.startswith("Error generating code critique"):
+                # Removed: yield {"type": "agent", "agent": "📊 Code Critic", "content": full_critic_analysis}
+                critic_grade = self._extract_grade(full_critic_analysis)
+            elif full_critic_analysis: # It's an error message from the stream
+                 yield {"type": "error", "content": f"Code Critic failed: {full_critic_analysis}"}
+
 
         if self.grading_enabled and generated_image_paths_batch:
             yield {"type": "system", "content": "🎨 Art Critic Agent analyzing generated visual elements and grading (batch)..."}
@@ -371,21 +429,50 @@ class EnhancedMultiAgentSystem:
             for i, image_path in enumerate(generated_image_paths_batch):
                 image_filename = os.path.basename(str(image_path))
                 yield {"type": "system", "content": f"🎨 Art Critic evaluating image: {image_filename} ({i+1}/{len(generated_image_paths_batch)})..."}
-                art_analysis_single = self._get_art_critique(original_user_prompt, main_response_text, implementation_results, target_image_path=str(image_path))
-                if art_analysis_single:
-                    current_art_grade = self._extract_grade(art_analysis_single)
-                    all_art_critiques.append({"image_path": str(image_path), "critique_text": art_analysis_single, "grade": current_art_grade})
-                    yield {"type": "agent", "agent": f"🎭 Art Critic ({image_filename})", "content": art_analysis_single}
+
+                art_analysis_chunks = []
+                full_art_analysis_single = ""
+                try:
+                    for chunk_text in self._get_art_critique(original_user_prompt, main_response_text, implementation_results, target_image_path=str(image_path)):
+                        art_analysis_chunks.append(chunk_text)
+                        yield {"type": "agent_stream_chunk", "agent": f"🎭 Art Critic ({image_filename})", "content": chunk_text}
+                    full_art_analysis_single = "".join(art_analysis_chunks)
+                    self._log_interaction(f"art_critic_{image_filename}", full_art_analysis_single) # Log complete text
+                except Exception as e:
+                    full_art_analysis_single = f"Error processing art critique stream for {image_filename}: {e}"
+                    self._log_interaction(f"art_critic_{image_filename}", full_art_analysis_single)
+
+                if full_art_analysis_single and not full_art_analysis_single.startswith("Error generating art critique"):
+                    current_art_grade = self._extract_grade(full_art_analysis_single)
+                    all_art_critiques.append({"image_path": str(image_path), "critique_text": full_art_analysis_single, "grade": current_art_grade})
+                    # Removed: yield {"type": "agent", "agent": f"🎭 Art Critic ({image_filename})", "content": full_art_analysis_single}
+                elif full_art_analysis_single:
+                    yield {"type": "error", "content": f"Art Critic failed for {image_filename}: {full_art_analysis_single}"}
+
             yield {"type": "agent_status_update", "agent": "art_critic", "status": "inactive"}
         elif should_use_art_critic and self.grading_enabled:
             yield {"type": "system", "content": "🎨 Art Critic Agent analyzing visual elements (general)..."}
             yield {"type": "agent_status_update", "agent": "art_critic", "status": "active"}
-            art_analysis_general = self._get_art_critique(original_user_prompt, main_response_text, implementation_results, target_image_path=None)
+
+            art_analysis_general_chunks = []
+            full_art_analysis_general = ""
+            try:
+                for chunk_text in self._get_art_critique(original_user_prompt, main_response_text, implementation_results, target_image_path=None):
+                    art_analysis_general_chunks.append(chunk_text)
+                    yield {"type": "agent_stream_chunk", "agent": "🎭 Art Critic", "content": chunk_text}
+                full_art_analysis_general = "".join(art_analysis_general_chunks)
+                self._log_interaction("art_critic_general", full_art_analysis_general)
+            except Exception as e:
+                full_art_analysis_general = f"Error processing general art critique stream: {e}"
+                self._log_interaction("art_critic_general", full_art_analysis_general)
+
             yield {"type": "agent_status_update", "agent": "art_critic", "status": "inactive"}
-            if art_analysis_general:
-                current_art_grade_general = self._extract_grade(art_analysis_general)
-                all_art_critiques.append({"image_path": "general_critique", "critique_text": art_analysis_general, "grade": current_art_grade_general})
-                yield {"type": "agent", "agent": "🎭 Art Critic", "content": art_analysis_general}
+            if full_art_analysis_general and not full_art_analysis_general.startswith("Error generating art critique"):
+                current_art_grade_general = self._extract_grade(full_art_analysis_general)
+                all_art_critiques.append({"image_path": "general_critique", "critique_text": full_art_analysis_general, "grade": current_art_grade_general})
+                # Removed: yield {"type": "agent", "agent": "🎭 Art Critic", "content": full_art_analysis_general}
+            elif full_art_analysis_general:
+                yield {"type": "error", "content": f"General Art Critic failed: {full_art_analysis_general}"}
 
         highest_art_grade = -1
         if all_art_critiques:
@@ -591,15 +678,15 @@ Please provide a comprehensive code review focusing on quality, security, perfor
 """
         
         try:
-            response = self.client.models.generate_content(
+            response_stream = self.client.models.generate_content_stream(
                 model=TEXT_MODEL_NAME,
                 contents=[{"text": f"{CRITIC_AGENT_PROMPT}\n\n{critique_context}"}]
             )
-            self._log_interaction("code_critic", response.text)
-            return response.text
+            for chunk in response_stream:
+                yield chunk.text
         except Exception as e:
             self.error_context.append(f"Code Critic Error: {e}")
-            return None
+            yield f"Error generating code critique: {e}" # Yield error message as part of the stream
 
     def _get_art_critique(self, user_prompt, main_response, implementation_results, target_image_path=None):
         """Get enhanced art critique with vision capabilities, focusing on a target image if provided."""
@@ -632,15 +719,15 @@ Please analyze visual elements, provide design guidance, and suggest improvement
         art_context_parts = self._build_visual_context(art_context_text, ART_AGENT_PROMPT)
         
         try:
-            response = self.client.models.generate_content(
+            response_stream = self.client.models.generate_content_stream(
                 model=TEXT_MODEL_NAME,
                 contents=art_context_parts
             )
-            self._log_interaction("art_critic", response.text)
-            return response.text
+            for chunk in response_stream:
+                yield chunk.text
         except Exception as e:
             self.error_context.append(f"Art Critic Error: {e}")
-            return None
+            yield f"Error generating art critique: {e}" # Yield error message as part of the stream
 
     def _get_proactive_art_guidance(self, current_user_prompt):
         """Get proactive art guidance before image generation."""
@@ -659,15 +746,22 @@ Please analyze visual elements, provide design guidance, and suggest improvement
                 system_prompt=formatted_proactive_prompt # This is the main system prompt for the agent
             )
 
-            response = self.client.models.generate_content(
+            response_stream = self.client.models.generate_content_stream(
                 model=TEXT_MODEL_NAME,
                 contents=proactive_art_context_parts
             )
-            self._log_interaction("proactive_art_critic", response.text)
-            return response.text
+            full_response_text = ""
+            for chunk in response_stream:
+                if chunk.text:
+                    full_response_text += chunk.text
+                    yield chunk.text
+            self._log_interaction("proactive_art_critic", full_response_text) # Log the complete text after streaming
+            # Note: The return of the accumulated text is handled by the loop yielding chunks.
+            # If no chunks, nothing is yielded beyond what the calling function handles.
         except Exception as e:
             self.error_context.append(f"Proactive Art Critic Error: {e}")
-            return None
+            yield f"Error generating proactive art guidance: {e}" # Yield error message as part of the stream
+
 
     def _move_to_trash(self, image_paths_to_move):
         """Moves specified image paths to the .trash directory within VM_DIR."""
@@ -1937,6 +2031,61 @@ class EnhancedGeminiIDE(tk.Tk):
         self.chat.config(state="disabled")
         self.notebook.select(1)  # Switch to chat tab
 
+    def _append_chat_chunk(self, sender, chunk_content, color="#000000"):
+        """Appends a chunk of text to the chat, typically from a streaming response."""
+        self.chat.config(state="normal")
+
+        # Optimization: If the last message was from the same sender and also a chunk,
+        # just append the text without new sender/timestamp.
+        # This requires tracking the last message type/sender, or inspecting the Text widget.
+        # For simplicity, this example will append each chunk as a new segment,
+        # but prefix with a continuation character or similar if it's not the first chunk.
+
+        # Check if this is the first chunk for this sender in this stream segment
+        # A more robust way would be to manage state outside this function or pass a flag.
+        # For now, we'll assume each call to this might be a new "start" of a chunk segment
+        # or a continuation. A simple heuristic: if the last char is not a newline, it's a continuation.
+
+        # A more complex check could involve tags:
+        # last_char_index = self.chat.index(f"{tk.END}-2c") # -1c is newline, -2c is char before it
+        # tags_on_last_char = self.chat.tag_names(last_char_index)
+        # is_continuation = f"sender_chunk_{re.sub(r'\W+', '', sender)}" in tags_on_last_char
+
+        # Simple approach: always append. The UI might look slightly disjointed for rapid chunks.
+        # To make it smoother, one would manage a "current stream message" and append to its content.
+
+        # For now, just append the content. Real-time display of agent name per chunk might be too noisy.
+        # The `add_chat_message` handles sender name and timestamp.
+        # This function is for the *content* of the stream.
+
+        # We could consider a "start_stream" message type that prints "Agent X: "
+        # and then agent_stream_chunk just appends content.
+
+        # If the chat is empty or the last content was not from this agent streaming, print sender header.
+        # This is a heuristic.
+        current_chat_content = self.chat.get("1.0", tk.END).strip()
+        if not current_chat_content.endswith(sender + ":\n"): # A bit simplistic
+            # Check if the very last text inserted was for this agent's stream.
+            # This is hard without more state.
+            # Let's assume for now that the "agent_stream_chunk" is a signal to just append text.
+            # The initial "Agent X:" would be printed by a regular "agent" message type if needed,
+            # or we add a specific "agent_stream_start" message type.
+
+            # If no prior message from this agent, or last message was different, print sender name.
+            # This is a placeholder for better stream handling logic.
+            # A better way: the first chunk could be a normal "agent" message, and subsequent ones "agent_stream_chunk"
+            # which just appends. Or, _process_messages tracks current streaming agent.
+            pass # For now, assume the calling logic handles the initial "Agent X:" part.
+
+        self.chat.insert(tk.END, chunk_content, ("stream_chunk", color)) # Apply a generic stream_chunk tag + color
+        self.chat.tag_configure("stream_chunk", foreground=color) # Ensure color is applied
+
+        self.chat.see(tk.END)
+        self.chat.config(state="disabled")
+        if self.notebook.index(self.notebook.select()) != 1: # If chat tab is not selected
+            self.notebook.select(1)
+
+
     # Additional enhanced methods
     def test_agent(self, agent_type):
         """Test individual agent functionality"""
@@ -2543,6 +2692,15 @@ class EnhancedGeminiIDE(tk.Tk):
                     }
                     color = agent_colors.get(agent_name, self.fg_color_light) # Default to fg_color_light
                     self.add_chat_message(agent_name, msg["content"], color)
+                elif msg["type"] == "agent_stream_chunk":
+                    agent_name = msg["agent"]
+                    # Determine color based on agent, similar to "agent" type
+                    agent_colors = {
+                        "🤖 Main Coder": "#2E8B57", # Example color
+                        # Add other agents if they also stream
+                    }
+                    color = agent_colors.get(agent_name, self.fg_color_light)
+                    self._append_chat_chunk(agent_name, msg["content"], color)
                 elif msg["type"] == "system":
                     self.add_chat_message("🔧 System", msg["content"], color=self.system_chat_color) # Use defined system color
                 elif msg["type"] == "error":
