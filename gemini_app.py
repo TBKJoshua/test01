@@ -224,7 +224,11 @@ class EnhancedMultiAgentSystem:
         self.client = genai.Client(api_key=api_key)
         self.conversation_history = []
         self.error_context = []
-        self.project_context = {"files": [], "images": [], "recent_changes": []}
+        # project_context will be populated by _update_project_context during run_enhanced_interaction
+        self.project_context = {}
+        self.project_files_cache = None # Cache for file listings
+        self.project_files_changed = True # Flag to indicate if cache is stale
+        self.file_snippet_cache = {} # Cache for file snippets: {rel_path: (mtime, content_snippet)}
         self.grading_enabled = True
         self.prompt_enhancer_enabled = True
         self.max_retry_attempts = 3
@@ -834,12 +838,42 @@ Focus on actionable improvements that leverage all three agent perspectives.
             return None
 
     def _update_project_context(self):
-        """Update project context for better agent awareness"""
-        self.project_context = {
-            "files": self._get_project_files(),
-            "images": self._get_project_images(),
-            "recent_changes": self._get_recent_changes()
-        }
+        """Update project context for better agent awareness, using caching."""
+        if self.project_files_changed or self.project_files_cache is None:
+            # Clear snippet cache when main file/image list is rebuilt
+            self.file_snippet_cache.clear()
+
+            # Scan the file system because cache is stale or non-existent
+            current_files = self._scan_project_files()
+            current_images = self._scan_project_images()
+
+            # Update the cache
+            self.project_files_cache = {
+                "files": current_files,
+                "images": current_images,
+                "timestamp": time.time()
+            }
+            self.project_files_changed = False # Cache is now fresh
+
+            # Update project_context with fresh data
+            # Preserve recent_changes which is managed independently
+            existing_recent_changes = self.project_context.get("recent_changes", [])
+            self.project_context = {
+                "files": current_files,
+                "images": current_images,
+                "recent_changes": existing_recent_changes
+            }
+        else:
+            # Cache is valid, ensure project_context reflects cached files/images.
+            # This is mainly for consistency if project_context was somehow altered elsewhere,
+            # or for the first time project_context is being fully populated after __init__.
+            self.project_context["files"] = self.project_files_cache["files"]
+            self.project_context["images"] = self.project_files_cache["images"]
+            # Ensure "recent_changes" key exists, even if empty
+            if "recent_changes" not in self.project_context:
+                 self.project_context["recent_changes"] = []
+        # Note: self.project_context["recent_changes"] is primarily updated by
+        # _process_enhanced_commands and retrieved by _get_recent_changes.
 
     def _build_enhanced_prompt(self, user_prompt, system_prompt, proactive_art_advice=None):
         """Build enhanced prompt with comprehensive context"""
@@ -870,10 +904,27 @@ Focus on actionable improvements that leverage all three agent perspectives.
                             except Exception:
                                 prompt_parts.append({"text": f"\n--- IMAGE ERROR: {rel_path} ---\n"})
                         else:
-                            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                                content = f.read(3000)  # Increased content limit
-                            prompt_parts.append({"text": f"\n--- FILE: {rel_path} ---\n{content}\n"})
-                    except IOError:
+                            content_snippet = ""
+                            try:
+                                current_mtime = os.path.getmtime(file_path)
+                                if rel_path in self.file_snippet_cache:
+                                    cached_mtime, cached_snippet = self.file_snippet_cache[rel_path]
+                                    if current_mtime == cached_mtime:
+                                        content_snippet = cached_snippet
+                                    else:
+                                        # Timestamp changed, file modified
+                                        pass # Will re-read below
+
+                                if not content_snippet: # Not cached or modified
+                                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                                        content_snippet = f.read(3000)
+                                    self.file_snippet_cache[rel_path] = (current_mtime, content_snippet)
+                            except OSError: # e.g. file deleted during prompt build
+                                content_snippet = "[Error reading file content]"
+
+                            prompt_parts.append({"text": f"\n--- FILE: {rel_path} ---\n{content_snippet}\n"})
+                    except IOError: # This broader IOError might catch the Image.open as well if it fails early
+                        prompt_parts.append({"text": f"\n--- FILE/IMAGE ERROR (IOError): {rel_path} ---\n"})
                         continue
 
         # Add conversation history for context
@@ -1013,11 +1064,22 @@ Focus on actionable improvements that leverage all three agent perspectives.
         return error_count > 0 or complex_operations > 2
 
     def _has_project_images(self):
-        """Check if project contains images"""
+        """Check if project contains images, using cached context if available."""
+        # Try to use cached image list first
+        if self.project_context and "images" in self.project_context:
+            # Ensure _update_project_context has been called at least once recently
+            # by checking if project_files_cache is populated.
+            if self.project_files_cache and self.project_context["images"] is not None:
+                return bool(self.project_context["images"])
+
+        # Fallback to scanning the directory if cache isn't conclusive or not ready
         if not VM_DIR.exists():
             return False
         
-        for root, _, files in os.walk(VM_DIR):
+        for root, dirs, files in os.walk(VM_DIR):
+            # Prevent traversing into TRASH_DIR_NAME
+            if TRASH_DIR_NAME in dirs:
+                dirs.remove(TRASH_DIR_NAME)
             for name in files:
                 if name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
                     return True
@@ -1085,12 +1147,19 @@ Focus on actionable improvements that leverage all three agent perspectives.
                         yield {"type": "system", "content": result}
 
                     # Track successful changes
-                    if func_name in ["create_file", "write_to_file", "generate_image"]:
+                    if func_name in ["create_file", "write_to_file", "generate_image", "delete_file", "rename_file"]:
+                        # Ensure recent_changes is initialized if it wasn't (e.g. first run or cleared context)
+                        if "recent_changes" not in self.project_context:
+                            self.project_context["recent_changes"] = []
+
                         self.project_context["recent_changes"].append({
                             "command": func_name,
                             "args": args, # Log sanitized args
                             "timestamp": time.time()
                         })
+                        # Keep recent_changes list trimmed
+                        self.project_context["recent_changes"] = self.project_context["recent_changes"][-20:]
+                        self.project_files_changed = True # Invalidate file/image cache
                     continue # Move to the next matched command
 
                 # If the for loop for args was broken (due to bad arg), skip to next command match
@@ -1155,31 +1224,46 @@ Focus on actionable improvements that leverage all three agent perspectives.
         
         return "\n".join(summary)
 
-    def _get_project_files(self):
-        """Get list of project files"""
+    def _scan_project_files(self):
+        """Scans and returns a list of project files (non-images). Internal use for cache building."""
         files = []
         if VM_DIR.exists():
-            for root, _, filenames in os.walk(VM_DIR):
+            for root, dirs, filenames in os.walk(VM_DIR):
+                # Prevent traversing into TRASH_DIR_NAME
+                if TRASH_DIR_NAME in dirs:
+                    dirs.remove(TRASH_DIR_NAME)
                 for name in filenames:
                     if not name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
                         rel_path = os.path.relpath(os.path.join(root, name), VM_DIR)
                         files.append(rel_path)
         return files
 
-    def _get_project_images(self):
-        """Get list of project images"""
+    def _scan_project_images(self):
+        """Scans and returns a list of project images. Internal use for cache building."""
         images = []
         if VM_DIR.exists():
-            for root, _, filenames in os.walk(VM_DIR):
+            for root, dirs, filenames in os.walk(VM_DIR):
+                # Prevent traversing into TRASH_DIR_NAME
+                if TRASH_DIR_NAME in dirs:
+                    dirs.remove(TRASH_DIR_NAME)
                 for name in filenames:
                     if name.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
                         rel_path = os.path.relpath(os.path.join(root, name), VM_DIR)
                         images.append(rel_path)
         return images
 
+    def _get_project_files(self):
+        """Get list of project files from context (populated by _update_project_context)."""
+        return self.project_context.get("files", [])
+
+    def _get_project_images(self):
+        """Get list of project images from context (populated by _update_project_context)."""
+        return self.project_context.get("images", [])
+
     def _get_recent_changes(self):
-        """Get recent project changes"""
-        return self.project_context.get("recent_changes", [])[-10:]  # Last 10 changes
+        """Get recent project changes from context (populated by _process_enhanced_commands)."""
+        # This returns the managed list of recent changes, which is already trimmed.
+        return self.project_context.get("recent_changes", [])
 
     def _extract_grade(self, agent_response):
         """Extract numerical grade from agent response"""
@@ -1493,6 +1577,10 @@ class EnhancedGeminiIDE(tk.Tk):
         self.current_image = None
         self.current_open_file_path = None
 
+        # File tree cache
+        self.file_tree_cache = {} # Stores {'path_str': {'name': '', 'is_dir': False, 'size': 0, 'children': {}}}
+        self.file_tree_cache_dirty = True
+
         # Debouncing variables
         self._debounce_refresh_id = None
         self._debounce_insights_id = None
@@ -1705,7 +1793,7 @@ class EnhancedGeminiIDE(tk.Tk):
         self.editor.tag_configure("class", foreground="#4ec9b0")
         self.editor.tag_configure("operator", foreground="#d4d4d4")
 
-        self.syntax_patterns = {
+        raw_patterns = {
             "keyword": r"\b(def|class|import|from|for|while|if|elif|else|return|in|and|or|not|is|with|as|try|except|finally|raise|yield|pass|continue|break|global|nonlocal|lambda|assert|async|await)\b",
             "string": r"(\".*?\"|\'.*?\'|\"\"\".*?\"\"\"|\'\'\'.*?\'\'\')",
             "comment": r"#.*",
@@ -1714,16 +1802,20 @@ class EnhancedGeminiIDE(tk.Tk):
             "class": r"\bclass\s+([a-zA-Z_][a-zA-Z0-9_]*)",
             "operator": r"[+\-*/=<>!&|^~%]"
         }
+        self.compiled_syntax_patterns = {
+            tag: re.compile(pattern, re.MULTILINE | re.DOTALL)
+            for tag, pattern in raw_patterns.items()
+        }
 
     def _apply_full_syntax_highlighting(self): # Renamed here
         """Apply full syntax highlighting to the entire document."""
         content = self.editor.get("1.0", tk.END)
 
-        for tag in self.syntax_patterns.keys():
+        for tag in self.compiled_syntax_patterns.keys():
             self.editor.tag_remove(tag, "1.0", tk.END)
 
-        for tag, pattern in self.syntax_patterns.items():
-            for match in re.finditer(pattern, content, re.MULTILINE | re.DOTALL):
+        for tag, compiled_pattern in self.compiled_syntax_patterns.items():
+            for match in compiled_pattern.finditer(content): # No need for flags here
                 start, end = match.span()
                 self.editor.tag_add(tag, f"1.0+{start}c", f"1.0+{end}c")
 
@@ -1733,13 +1825,13 @@ class EnhancedGeminiIDE(tk.Tk):
             current_pos = self.editor.index(tk.INSERT)
             current_line = int(current_pos.split('.')[0])
 
-            # Define the range of lines to highlight (e.g., 10 lines above and below)
-            start_line = max(1, current_line - 10)
+            # Define the range of lines to highlight (e.g., 5 lines above and below)
+            start_line = max(1, current_line - 5)
             # Ensure end_line does not exceed the document's last line
             last_doc_line_str = self.editor.index(f"{tk.END}-1c").split('.')[0] # Get "line.char" then "line"
             last_doc_line = int(last_doc_line_str) if last_doc_line_str.isdigit() else 1 # Handle empty or non-numeric doc case
 
-            end_line = min(last_doc_line, current_line + 10)
+            end_line = min(last_doc_line, current_line + 5)
 
             # Ensure start_line is not greater than end_line, can happen if last_doc_line is small
             if start_line > end_line:
@@ -1754,12 +1846,12 @@ class EnhancedGeminiIDE(tk.Tk):
                 return
 
             # Remove old tags only from this range
-            for tag_key in self.syntax_patterns.keys(): # Use a consistent variable name like tag_key or pattern_name
+            for tag_key in self.compiled_syntax_patterns.keys(): # Use compiled patterns
                 self.editor.tag_remove(tag_key, start_index, end_index)
 
             # Apply patterns to the extracted content
-            for tag_key, pattern in self.syntax_patterns.items():
-                for match in re.finditer(pattern, content_to_highlight, re.MULTILINE | re.DOTALL):
+            for tag_key, compiled_pattern in self.compiled_syntax_patterns.items(): # Use compiled patterns
+                for match in compiled_pattern.finditer(content_to_highlight): # No need for flags here
                     match_start_offset, match_end_offset = match.span()
 
                     # Calculate absolute document indices for the match
@@ -1962,42 +2054,87 @@ class EnhancedGeminiIDE(tk.Tk):
             self.status_var.set(f"❌ Image error: {str(e)}")
 
     def refresh_files(self):
-        """Enhanced file tree refresh with metadata"""
-        self.tree.delete(*self.tree.get_children())
-        self._populate_enhanced_tree(VM_DIR, "")
+        """Enhanced file tree refresh with metadata, using caching."""
+        self.tree.delete(*self.tree.get_children()) # Clear existing tree items
 
-    def _populate_enhanced_tree(self, path, parent):
-        """Enhanced tree population with file sizes"""
-        for item in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
-            if item.is_dir():
+        if self.file_tree_cache_dirty:
+            self.file_tree_cache.clear() # Clear the old cache
+            self._rebuild_file_tree_cache(VM_DIR, self.file_tree_cache)
+            self.file_tree_cache_dirty = False
+
+        # Now call the method that populates the tree from the cache
+        self._populate_tree_from_cache("", self.file_tree_cache)
+
+    def _rebuild_file_tree_cache(self, current_path_obj, current_cache_level):
+        """Recursively builds the file tree cache."""
+        try:
+            for item in sorted(current_path_obj.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
+                if item.name == TRASH_DIR_NAME: # Skip trash directory
+                    continue
+
+                rel_path_str = str(item.relative_to(VM_DIR))
+                try:
+                    stat_info = item.stat()
+                    is_dir = item.is_dir()
+
+                    current_cache_level[rel_path_str] = {
+                        'name': item.name,
+                        'is_dir': is_dir,
+                        'size': stat_info.st_size,
+                        'children': {} # Initialize children, populated if it's a directory
+                    }
+
+                    if is_dir:
+                        self._rebuild_file_tree_cache(item, current_cache_level[rel_path_str]['children'])
+                except OSError as e:
+                    # Could log this error, e.g., permission denied or file not found during iter
+                    print(f"OSError when processing {item}: {e}") # Temporary print
+                    continue
+        except OSError as e:
+            # Error iterating directory itself
+            print(f"OSError when iterating {current_path_obj}: {e}") # Temporary print
+
+
+    def _populate_tree_from_cache(self, parent_tree_id, cache_node_data):
+        """Populates the ttk.Treeview from the cached file structure."""
+        # Sort items by directory first, then by name (similar to original logic)
+        # The cache_node_data is a dict where keys are rel_path_str
+        # We need to sort based on the 'name' and 'is_dir' attributes of the cache entries.
+        sorted_item_keys = sorted(cache_node_data.keys(),
+                                  key=lambda k: (not cache_node_data[k]['is_dir'], cache_node_data[k]['name'].lower()))
+
+        for rel_path_str in sorted_item_keys:
+            item_data = cache_node_data[rel_path_str]
+            item_name = item_data['name']
+
+            if item_data['is_dir']:
                 node = self.tree.insert(
-                    parent, 
-                    'end', 
-                    text=f"📁 {item.name}", 
-                    values=(str(item.relative_to(VM_DIR)), ""), 
+                    parent_tree_id,
+                    'end',
+                    text=f"📁 {item_name}",
+                    values=(rel_path_str, ""), # No size for directories in this column
                     open=False
                 )
-                self._populate_enhanced_tree(item, node)
+                self._populate_tree_from_cache(node, item_data['children'])
             else:
-                try:
-                    file_size = item.stat().st_size
-                    size_str = self._format_file_size(file_size)
+                size_str = self._format_file_size(item_data['size'])
+
+                # Determine icon based on suffix (similar to original logic)
+                # This requires getting suffix from item_name
+                name_path = Path(item_name)
+                if name_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+                    icon = "🖼️"
+                elif name_path.suffix.lower() in ['.py', '.js', '.html', '.css']:
+                    icon = "📝"
+                else:
+                    icon = "📄"
                     
-                    if item.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
-                        icon = "🖼️"
-                    elif item.suffix.lower() in ['.py', '.js', '.html', '.css']:
-                        icon = "📝"
-                    else:
-                        icon = "📄"
-                        
-                    node = self.tree.insert(
-                        parent, 
-                        'end', 
-                        text=f"{icon} {item.name}", 
-                        values=(str(item.relative_to(VM_DIR)), size_str)
-                    )
-                except OSError:
-                    continue
+                self.tree.insert(
+                    parent_tree_id,
+                    'end',
+                    text=f"{icon} {item_name}",
+                    values=(rel_path_str, size_str)
+                )
 
     def _format_file_size(self, size):
         """Format file size in human readable format"""
@@ -2365,9 +2502,11 @@ class EnhancedGeminiIDE(tk.Tk):
             self.editor.config(state="normal")
             self.editor.delete("1.0", tk.END)
             self.editor.insert("1.0", content)
-            self.editor.config(state="normal")
+            # Editor state is already normal from the line above.
 
-            self._apply_full_syntax_highlighting() # Changed here
+            # Schedule full syntax highlighting to run after a short delay (e.g., 50ms)
+            # This allows the UI to render the plain text first, improving perceived responsiveness.
+            self.after(50, self._apply_full_syntax_highlighting)
             self.notebook.select(0)  # Switch to editor tab
             
             line_count = len(content.splitlines())
@@ -2418,6 +2557,7 @@ class EnhancedGeminiIDE(tk.Tk):
                 try:
                     file_path.parent.mkdir(parents=True, exist_ok=True)
                     file_path.touch()
+                    self.file_tree_cache_dirty = True # Invalidate IDE file tree cache
                     self._schedule_refresh_files()
                     self.display_file(file_path)
                     self.status_var.set(f"✅ Created: {file_name}")
@@ -2446,6 +2586,7 @@ class EnhancedGeminiIDE(tk.Tk):
                 old_full_path.rename(new_full_path)
                 if self.current_open_file_path and self.current_open_file_path == old_full_path:
                     self.current_open_file_path = new_full_path
+                self.file_tree_cache_dirty = True # Invalidate IDE file tree cache
                 self._schedule_refresh_files()
                 self.status_var.set(f"✅ Renamed: {old_rel_path.name} → {new_name}")
                 self._schedule_update_insights()
@@ -2478,6 +2619,7 @@ class EnhancedGeminiIDE(tk.Tk):
                     self.editor.delete("1.0", tk.END)
                     self.current_open_file_path = None
 
+                self.file_tree_cache_dirty = True # Invalidate IDE file tree cache
                 self._schedule_refresh_files()
                 self._schedule_update_insights()
             except Exception as e:
@@ -2761,6 +2903,7 @@ class EnhancedGeminiIDE(tk.Tk):
                 elif msg["type"] == "screenshot_info":
                     self.status_var.set(msg["content"])
                 elif msg["type"] == "file_changed":
+                    self.file_tree_cache_dirty = True # Invalidate IDE file tree cache
                     self._schedule_refresh_files()
                     self._schedule_update_insights()
                     changed_file_path = Path(msg["content"])
