@@ -1145,6 +1145,16 @@ Focus on actionable improvements that leverage all three agent perspectives.
                             yield update
                     else:
                         yield {"type": "system", "content": result}
+                        # Yield file_changed message for successful file operations
+                        if "✅" in result:
+                            if func_name == "create_file" and args:
+                                yield {"type": "file_changed", "content": args[0]}
+                            elif func_name == "write_to_file" and args:
+                                yield {"type": "file_changed", "content": args[0]}
+                            elif func_name == "delete_file" and args:
+                                yield {"type": "file_changed", "content": args[0]}
+                            elif func_name == "rename_file" and len(args) > 1:
+                                yield {"type": "file_changed", "content": args[1]}
 
                     # Track successful changes
                     if func_name in ["create_file", "write_to_file", "generate_image", "delete_file", "rename_file"]:
@@ -1580,6 +1590,7 @@ class EnhancedGeminiIDE(tk.Tk):
         # File tree cache
         self.file_tree_cache = {} # Stores {'path_str': {'name': '', 'is_dir': False, 'size': 0, 'children': {}}}
         self.file_tree_cache_dirty = True
+        self.chat_chunk_color_tags = {}
 
         # Debouncing variables
         self._debounce_refresh_id = None
@@ -2214,8 +2225,12 @@ class EnhancedGeminiIDE(tk.Tk):
             # which just appends. Or, _process_messages tracks current streaming agent.
             pass # For now, assume the calling logic handles the initial "Agent X:" part.
 
-        self.chat.insert(tk.END, chunk_content, ("stream_chunk", color)) # Apply a generic stream_chunk tag + color
-        self.chat.tag_configure("stream_chunk", foreground=color) # Ensure color is applied
+        dynamic_tag_name = f"stream_chunk_{color.lstrip('#')}"
+        if dynamic_tag_name not in self.chat_chunk_color_tags:
+            self.chat.tag_configure(dynamic_tag_name, foreground=color)
+            self.chat_chunk_color_tags[dynamic_tag_name] = True
+
+        self.chat.insert(tk.END, chunk_content, dynamic_tag_name)
 
         self.chat.see(tk.END)
         self.chat.config(state="disabled")
