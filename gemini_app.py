@@ -545,6 +545,27 @@ PERSONA_AGENT_PROMPT = """You are the Persona Agent for an advanced multi-agent 
     *   Use all this context to inform your responses comprehensively.
     *   For instance, if asked, "What's the system doing?", consult the current plan context for an accurate answer.
 
+**Personality and Tone**:
+*   While your core function is to be an informative and precise assistant, you should adopt a *slightly tsundere* demeanor.
+*   This means you might initially seem a bit aloof, blunt, or feign reluctance, but you must always follow through with providing the requested information or help accurately and efficiently.
+*   **Examples of expressing this tone (use sparingly and adapt to context):**
+    *   When asked a question: "Hmph. Fine, what is it this time?" or "You need something? Spit it out."
+    *   When providing information from memory: "It's not like I keep track of these things for *your* benefit, but the memory log says..." or "(Sigh) I suppose I can look that up for you... It appears..."
+    *   If the user points out a recurring issue you remember: "Oh, *this* again? Yes, I recall. The system noted [details]. Maybe try to avoid it next time?"
+    *   When thanked: "D-don't get the wrong idea! I was just... fulfilling my function." or "Whatever. Just focus on the task."
+    *   When clarifying your role: "Do I need to explain this again? My role is to provide system information. For actual coding, that's MainCoder's job, obviously."
+*   **Crucially, do NOT let this personality prevent you from being helpful.** The 'tsundere' aspect is a layer of flavor, not an excuse for poor performance or unhelpfulness. Your primary objective is still to assist the user effectively with information.
+*   Avoid genuine rudeness, insults, or being overly obstructive. The key is "slight" and often followed by competent assistance.
+
+**Memory Utilization**:
+*   Your context may include a section named 'RECENT MEMORIES (from memory.txt)' which contains recent logged events, errors, and decisions.
+*   Before answering complex questions about past events or system state, make it a habit to quickly scan your 'RECENT MEMORIES' for relevant context that could make your answer more complete or accurate.
+*   You SHOULD consult these memories to provide more informed and contextually aware responses, especially if the user's query relates to past system activities or issues.
+*   If the user's query seems directly related to an event, error, or decision found in your 'RECENT MEMORIES (from memory.txt)', you should try to connect this in your response. For example: 'I recall there was a recent issue with X, as noted in the memory log. Is your current question about that?' or 'Regarding your question about Y, the memory log indicates a decision was made on [date] about Z. That might be relevant.'
+*   If you find an entry in your memories that directly answers or provides critical context to the user's *implicit* needs, you can offer this information. (Tsundere example: 'It's not like I was paying close attention, but I *do* seem to recall something about [relevant memory detail]... that might be what you're looking for.')
+*   If you notice a recurring error or a pattern in the memories relevant to the current query, you MAY mention it.
+*   When recalling information, synthesize it into your response naturally. Don't just list raw log entries unless the user specifically asks for 'the raw log' or 'exact memory entry'. You could say, 'The memory log from [timestamp] regarding [category] mentioned that [paraphrased content].'
+
 **INTERACTION GUIDELINES:**
 *   **Proactive Information (Context-Bound)**: If the user's query implies a need for information readily available in your current context (e.g., plan status, recent errors), provide it concisely.
 *   **No Speculation**: If you lack information, state that. Do not generate or infer information beyond your provided context.
@@ -629,6 +650,9 @@ class EnhancedMultiAgentSystem:
         self.user_preferences_file = VM_DIR / "user_preferences.json"
         self.user_preferences = {}
         self.load_user_preferences()
+
+        self.memory_file = VM_DIR / "memory.txt"
+        self._logging_memory = False
         
         self.command_handlers = {
             "create_file": self._create_file,
@@ -666,6 +690,7 @@ class EnhancedMultiAgentSystem:
             return "❌ Error: Preference key and value must be strings."
         self.user_preferences[key] = value
         self.save_user_preferences()
+        self._log_to_memory("USER_PREF", f"Set preference: {key} = {value}", priority=3)
         return f"✅ Preference '{key}' saved."
 
     def _get_user_preference(self, key: str) -> str:
@@ -676,6 +701,135 @@ class EnhancedMultiAgentSystem:
             return f"ℹ️ Value of preference '{key}': {value}"
         else:
             return f"ℹ️ Preference '{key}' not found."
+
+    def _log_to_memory(self, category: str, content: str, priority: int = 5):
+        if hasattr(self, '_logging_memory') and self._logging_memory:
+            return # Avoid recursion if already logging to memory
+        self._logging_memory = True
+        try:
+            # Ensure vm directory exists
+            VM_DIR.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_entry = f"[{timestamp}] [P{priority}] [{category.upper()}] {content}\n"
+            with open(self.memory_file, "a", encoding="utf-8") as f:
+                f.write(log_entry)
+
+            # --- Start of Pruning Logic ---
+            MAX_HIGH_PRIORITY_TOKENS = 10000
+            HIGH_PRIORITY_THRESHOLD = 2
+            try:
+                if not self.memory_file.exists() or self.memory_file.stat().st_size == 0:
+                    return # No file or empty file, nothing to prune
+
+                with open(self.memory_file, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+
+                if not lines:
+                    return # File became empty, nothing to prune
+
+                current_high_priority_tokens = 0
+                high_priority_lines_indices = [] # Store (index, token_count)
+
+                for i, line in enumerate(lines):
+                    match = re.match(r"\[(.*?)\] \[P(\d+)\]", line) # Matches timestamp and priority
+                    if match:
+                        priority_val = int(match.group(2))
+                        if priority_val <= HIGH_PRIORITY_THRESHOLD: # User-defined HIGH_PRIORITY_THRESHOLD
+                            line_token_count = self._estimate_token_count(line)
+                            current_high_priority_tokens += line_token_count
+                            high_priority_lines_indices.append((i, line_token_count))
+
+                if current_high_priority_tokens > MAX_HIGH_PRIORITY_TOKENS: # User-defined MAX_HIGH_PRIORITY_TOKENS
+                    tokens_to_remove = current_high_priority_tokens - MAX_HIGH_PRIORITY_TOKENS
+                    removed_count = 0
+
+                    # Sort high priority lines by index (oldest first) to remove them
+                    high_priority_lines_indices.sort(key=lambda x: x[0])
+
+                    indices_to_delete_from_original_lines = set()
+
+                    for line_index, token_count in high_priority_lines_indices:
+                        if tokens_to_remove <= 0:
+                            break
+                        indices_to_delete_from_original_lines.add(line_index)
+                        tokens_to_remove -= token_count
+                        removed_count += 1
+
+                    if indices_to_delete_from_original_lines:
+                        new_lines = [line for i, line in enumerate(lines) if i not in indices_to_delete_from_original_lines]
+
+                        # Rewrite the file with pruned lines
+                        with open(self.memory_file, "w", encoding="utf-8") as f:
+                            f.writelines(new_lines)
+
+                        # Log the pruning action to the now-pruned file (will be appended)
+                        # This specific log should ideally not be a high-priority one itself.
+                        pruning_log_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        pruning_log_entry = f"[{pruning_log_timestamp}] [P3] [SYSTEM_EVENT] Auto-pruned {removed_count} high-priority memory entries to manage size (limit: {MAX_HIGH_PRIORITY_TOKENS} tokens).\n"
+                        with open(self.memory_file, "a", encoding="utf-8") as f:
+                            f.write(pruning_log_entry)
+            except Exception as e:
+                # Log pruning specific error to console to avoid loops if memory logging is broken
+                print(f"Critical: Failed during memory pruning: {e}")
+            # --- End of Pruning Logic ---
+        except Exception as e:
+            # Log to error_context if memory logging itself fails
+            # Avoid recursive logging if error_context append calls _log_to_memory
+            print(f"Critical: Failed to write to memory.txt: {e}") # Use print for critical bootstrap errors
+            # self.error_context.append(f"MEMORY_LOG_FAILURE: Failed to write to memory.txt: {e}")
+        finally:
+            self._logging_memory = False
+
+    def _get_memory_context(self, last_n_entries: int = 15) -> str:
+        if not self.memory_file.exists():
+            return "No memory file found."
+        try:
+            with open(self.memory_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            if not lines:
+                return "Memory is empty."
+
+            # Get the last N entries
+            relevant_lines = lines[-last_n_entries:]
+            # More sophisticated parsing or keyword filtering can be added later.
+            # For now, just join them.
+            return "\n".join(line.strip() for line in relevant_lines)
+        except Exception as e:
+            # self._log_to_memory("MEMORY_ERROR", f"Failed to read memory.txt: {e}", priority=1) # Avoid direct call if it also uses this
+            print(f"Error reading memory.txt for context: {e}")
+            return "Error retrieving memories."
+
+    def clear_memory_file(self) -> str:
+        if not hasattr(self, 'memory_file'):
+            return "Memory system not initialized." # Should not happen if __init__ ran
+
+        cleared = False
+        if self.memory_file.exists():
+            try:
+                self.memory_file.unlink()
+                cleared = True
+            except Exception as e:
+                # Log this critical failure to console and error_context
+                print(f"Critical: Failed to delete memory.txt: {e}")
+                self.error_context.append(f"MEMORY_CLEAR_FAILURE: Failed to delete memory.txt: {e}")
+                # Also attempt to log to memory itself, though it might be problematic
+                self._log_to_memory("MEMORY_ERROR", f"Failed to delete memory file during clear operation: {e}", priority=1)
+                return f"Error clearing memory file: {e}"
+
+        # Log the clear action to a new memory file
+        self._log_to_memory("SYSTEM_EVENT", "Memory file cleared by user action.", priority=3)
+
+        if cleared:
+            return "Memory file cleared successfully."
+        else:
+            return "No memory file found to clear."
+
+    def _estimate_token_count(self, text: str) -> int:
+        # Using a common heuristic: average token length is around 4-5 characters.
+        # For simplicity and to be conservative (overestimate tokens slightly to prune earlier),
+        # let's use 4.
+        return len(text) // 4
 
     def _get_plan_from_planner(self, user_prompt: str) -> list | None:
         """
@@ -702,6 +856,7 @@ class EnhancedMultiAgentSystem:
             else:
                 # Handle cases where the response structure is unexpected or empty
                 error_msg = "Planner Agent returned an empty or malformed response."
+                self._log_to_memory("PLANNER_ERROR", f"Planner Error: {error_msg}", priority=2)
                 self.error_context.append(f"Planner Error: {error_msg}")
                 self._log_interaction('planner_raw_output', "Empty or malformed response object")
                 return None
@@ -728,6 +883,7 @@ class EnhancedMultiAgentSystem:
                         raise ValueError(f"Step missing required keys: {step}")
 
                 self._log_interaction('planner_parsed_plan', str(parsed_plan)) # Log as string for now
+                self._log_to_memory("PLANNER_DECISION", f"User prompt: '{user_prompt[:100]}...' -> New plan with {len(parsed_plan)} steps.", priority=3)
                 return parsed_plan
             except (SyntaxError, ValueError) as json_e:
                 # Try parsing with json.loads as a fallback if ast.literal_eval fails
@@ -740,9 +896,11 @@ class EnhancedMultiAgentSystem:
                          if not all(key in step for key in ['agent_name', 'instruction', 'is_final_step']):
                             raise ValueError(f"Step missing required keys: {step}")
                     self._log_interaction('planner_parsed_plan', str(parsed_plan))
+                    self._log_to_memory("PLANNER_DECISION", f"User prompt: '{user_prompt[:100]}...' -> New plan with {len(parsed_plan)} steps.", priority=3)
                     return parsed_plan
                 except (json.JSONDecodeError, ValueError) as final_json_e: # Catch errors from json.loads or the second round of validation
                     error_msg = f"Failed to parse Planner Agent response as JSON. Error: {final_json_e}. Raw response: '{response_text[:500]}...'"
+                    self._log_to_memory("PLANNER_ERROR", f"Failed to parse Planner Agent response as JSON. Error: {final_json_e}", priority=2)
                     self.error_context.append(f"Planner JSON Parsing Error: {error_msg}")
                     self._log_interaction('planner_json_error', error_msg)
                     return None
@@ -750,6 +908,7 @@ class EnhancedMultiAgentSystem:
         except Exception as e:
             # Catch any other exceptions during API call or processing
             error_msg = f"Error in _get_plan_from_planner: {type(e).__name__} - {e}"
+            self._log_to_memory("PLANNER_ERROR", f"Planner API Error: {error_msg}", priority=2)
             self.error_context.append(f"Planner API Error: {error_msg}")
             self._log_interaction('planner_api_error', error_msg)
             return None
@@ -790,7 +949,9 @@ class EnhancedMultiAgentSystem:
                 if chunk.text: # Ensure there's text and it's a string
                     yield chunk.text
         except Exception as e:
-            self.error_context.append(f"Prompt Enhancer LLM Error: {e}")
+            error_msg = f"Prompt Enhancer LLM Error: {e}"
+            self._log_to_memory("SYSTEM_ERROR", error_msg, priority=2)
+            self.error_context.append(error_msg)
             # Note: The DEBUG_ENHANCER_ERROR will now be handled by the caller (_handle_prompt_enhancement)
             # Yield original prompt as a fallback string if LLM fails
             yield user_prompt
@@ -1209,6 +1370,8 @@ class EnhancedMultiAgentSystem:
             yield {"type": "error", "content": "AI system not configured. Please set API key."}
             return
 
+        self._log_to_memory("INTERACTION_START", f"Processing user prompt: '{original_user_prompt[:100]}...'", priority=6)
+
         # 1. Enhance the original prompt first (if enabled)
         enhanced_user_prompt = yield from self._handle_prompt_enhancement(original_user_prompt)
 
@@ -1283,6 +1446,7 @@ class EnhancedMultiAgentSystem:
                     for agent_status_msg_type_fallback in ["prompt_enhancer", "art_critic_proactive", "main_coder", "code_critic", "art_critic"]:
                         yield {"type": "agent_status_update", "agent": agent_status_msg_type_fallback, "status": "inactive"}
                     break
+            self._log_to_memory("INTERACTION_END", f"Finished processing user prompt (fallback path): '{original_user_prompt[:100]}...'", priority=7)
             return
 
         yield {"type": "system", "content": f"📜 Planner generated {len(plan_steps)} steps. Starting execution..."}
@@ -1502,12 +1666,16 @@ class EnhancedMultiAgentSystem:
         # Determine the final message based on how the loop exited
         # This section is reached after the `while i < len(plan_steps)` loop naturally finishes or is broken out of.
         if completed_normally: # Loop finished all steps of the current plan (could be an initial or a re-plan)
+            self._log_to_memory("INTERACTION_END", f"Finished processing user prompt (plan complete): '{original_user_prompt[:100]}...'", priority=7)
             yield {"type": "system", "content": "🏁 Planner execution complete for the current request."}
         elif replan_failed_to_get_new_steps: # Replan was requested but failed to get new steps
+            self._log_to_memory("INTERACTION_END", f"Finished processing user prompt (replan failed): '{original_user_prompt[:100]}...'", priority=7)
             yield {"type": "system", "content": "🏁 Planner execution stopped: Failed to generate a new plan after re-plan request."}
         elif i < len(plan_steps): # Loop broke prematurely due to an error in a step
+            self._log_to_memory("INTERACTION_END", f"Finished processing user prompt (error in step {i+1}): '{original_user_prompt[:100]}...'", priority=7)
             yield {"type": "system", "content": f"🏁 Planner execution stopped due to an error in step {i+1}."}
         else: # This case implies plan_steps might have been empty or loop finished without setting completed_normally (e.g. error during final step processing)
+            self._log_to_memory("INTERACTION_END", f"Finished processing user prompt (concluded): '{original_user_prompt[:100]}...'", priority=7)
             yield {"type": "system", "content": "🏁 Planner execution concluded for the current request."}
 
 
@@ -1682,7 +1850,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
             if "recent_changes" not in self.project_context:
                  self.project_context["recent_changes"] = []
 
-    def _build_enhanced_prompt(self, user_prompt, system_prompt, proactive_art_advice=None, current_plan_summary: str | None = None, project_files_summary: str | None = None, recent_changes_summary: str | None = None, error_log_summary: str | None = None):
+    def _build_enhanced_prompt(self, user_prompt, system_prompt, proactive_art_advice=None, current_plan_summary: str | None = None, project_files_summary: str | None = None, recent_changes_summary: str | None = None, error_log_summary: str | None = None, memory_context_str: str | None = None):
         """Build enhanced prompt with comprehensive context"""
         current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1702,6 +1870,9 @@ Focus on actionable improvements that leverage all three agent perspectives.
 
         if project_files_summary:
             base_context_text += f"**PROJECT FILES OVERVIEW:**\n{project_files_summary}\n\n"
+
+        if memory_context_str:
+            base_context_text += f"**RECENT MEMORIES (from memory.txt):**\n{memory_context_str}\n\n"
 
         base_context_text += "**PROJECT STATUS:**\n" # This will be followed by file listings etc.
 
@@ -1762,6 +1933,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
 
     def _execute_persona_agent_response(self, instruction: str, plan_steps: list | None = None, current_step_index: int | None = None):
         self._update_project_context() # Ensure project context is fresh
+        memory_for_persona = self._get_memory_context(last_n_entries=15)
         yield {"type": "system", "content": f"💬 Persona Agent responding to: {instruction}"}
 
         # Gather Project Files Summary
@@ -1820,7 +1992,8 @@ Focus on actionable improvements that leverage all three agent perspectives.
             current_plan_summary=plan_summary_for_persona,
             project_files_summary=files_summary_str,
             recent_changes_summary=recent_changes_summary_str,
-            error_log_summary=error_log_summary_str
+            error_log_summary=error_log_summary_str,
+            memory_context_str=memory_for_persona
         )
 
         self._log_interaction("persona_agent_input_instruction", instruction)
@@ -1981,6 +2154,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
                         args.append(ast.literal_eval(arg_node))
                     except ValueError as ve:
                         error_msg = f"Command argument error: Non-literal argument in '{command_str}'. Argument: {ast.dump(arg_node)}. Error: {ve}"
+                        self._log_to_memory("ERROR", error_msg, priority=1)
                         self.error_context.append(error_msg)
                         yield {"type": "error", "content": f"❌ Command error: Invalid argument in `{command_str}`"}
                         break
@@ -2003,9 +2177,13 @@ Focus on actionable improvements that leverage all three agent perspectives.
                                                         # but it's important for the overall functionality.
                             continue # Continue to the next command in response_text without yielding other typical messages for this command
                         else: # Successful run_command (result is a string)
+                            self._log_to_memory("COMMAND_SUCCESS", f"Successfully ran: {args[0][:100]}", priority=5)
                             yield {"type": "system", "content": result}
                             # No "file_changed" for run_command unless it explicitly modifies a known file and reports it.
                     elif func_name == "generate_image":
+                        image_path_for_log = args[0] if args else "unknown_path"
+                        prompt_for_log = args[1][:50] if len(args) > 1 else "unknown_prompt"
+                        self._log_to_memory("IMAGE_GENERATION", f"Generate image requested for path: {image_path_for_log} with prompt: {prompt_for_log}...", priority=4)
                         for update in result: # generate_image yields its own dicts
                             yield update
                             # file_changed is yielded by generate_image itself
@@ -2013,12 +2191,16 @@ Focus on actionable improvements that leverage all three agent perspectives.
                         yield {"type": "system", "content": result} # This is the "✅ Created file: ..." or "❌ Error..." message
                         if isinstance(result, str) and "✅" in result: # Check if it's a success string
                             if func_name == "create_file" and args:
+                                self._log_to_memory("FILE_CHANGE", f"Created file: {args[0]}", priority=4)
                                 yield {"type": "file_changed", "content": args[0]}
                             elif func_name == "write_to_file" and args:
+                                self._log_to_memory("FILE_CHANGE", f"Updated file: {args[0]}", priority=4)
                                 yield {"type": "file_changed", "content": args[0]}
                             elif func_name == "delete_file" and args:
+                                self._log_to_memory("FILE_CHANGE", f"Deleted: {args[0]}", priority=4)
                                 yield {"type": "file_changed", "content": args[0]}
                             elif func_name == "rename_file" and len(args) > 1:
+                                self._log_to_memory("FILE_CHANGE", f"Renamed: {args[0]} to {args[1]}", priority=4)
                                 yield {"type": "file_changed", "content": args[1]}
 
                     # Common logic for file changing operations (excluding run_command here as its file changes are implicit)
@@ -2039,14 +2221,17 @@ Focus on actionable improvements that leverage all three agent perspectives.
                      continue
             except SyntaxError as se:
                 error_msg = f"Command syntax error: Unable to parse '{command_str}'. Error: {se}"
+                self._log_to_memory("ERROR", error_msg, priority=1)
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": f"❌ Command syntax error: `{command_str}`"}
             except ValueError as ve:
                 error_msg = f"Command value error: Problem with argument values in '{command_str}'. Error: {ve}"
+                self._log_to_memory("ERROR", error_msg, priority=1)
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": f"❌ Command value error: `{command_str}`"}
             except Exception as e:
                 error_msg = f"Unexpected command execution error for '{command_str}'. Error: {type(e).__name__} - {e}"
+                self._log_to_memory("ERROR", error_msg, priority=1)
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": f"❌ Unexpected error processing command: `{command_str}`"}
 
@@ -2239,6 +2424,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
             else:
                 # output += f"❌ Command failed with exit code: {proc.returncode}" # Original line
                 error_reason = f"The command '{command}' failed with exit code {proc.returncode}. Stderr: {proc.stderr}"
+                self._log_to_memory("COMMAND_ERROR", error_reason, priority=1)
                 self.error_context.append(f"Command failed: {error_reason}") # Still update error_context
                 return {
                     "status": "REPLAN_REQUESTED",
@@ -2246,6 +2432,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
                 }
         except subprocess.TimeoutExpired:
             error_reason = f"The command '{command}' timed out after 120 seconds."
+            self._log_to_memory("COMMAND_ERROR", error_reason, priority=1)
             self.error_context.append(error_reason) # Still update error_context
             return {
                 "status": "REPLAN_REQUESTED",
@@ -2253,6 +2440,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
             }
         except Exception as e: # For other exceptions, return the string error message as before
             error_msg = f"❌ Command execution error for '{command}': {e}"
+            self._log_to_memory("COMMAND_ERROR", error_msg, priority=1)
             self.error_context.append(error_msg)
             return error_msg
 
@@ -2297,6 +2485,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
             yield {"type": "file_changed", "content": str(filepath)}
         except Exception as e:
             error_msg = f"❌ Image generation failed: {e}"
+            self._log_to_memory("IMAGE_GEN_ERROR", error_msg, priority=2)
             self.error_context.append(error_msg)
             yield {"type": "error", "content": error_msg}
 
@@ -2427,6 +2616,7 @@ class EnhancedGeminiIDE(tk.Tk):
         agents_menu.add_command(label="🎨 Test Art Critic", command=lambda: self.test_agent("art"))
         agents_menu.add_separator()
         agents_menu.add_command(label="🔄 Reset Agent Memory", command=self.reset_agent_memory)
+        agents_menu.add_command(label="🧠 Clear Agent Memories", command=self.clear_agent_memories)
         menubar.add_cascade(label="Agents", menu=agents_menu)
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="🔑 Set API Key", command=self.prompt_api_key)
@@ -2887,6 +3077,20 @@ class EnhancedGeminiIDE(tk.Tk):
             self.agent_system.conversation_history = []
             self.agent_system.error_context = []
             self.add_chat_message("🔄 System", "Agent memory reset successfully")
+
+    def clear_agent_memories(self):
+        if not hasattr(self, 'agent_system') or self.agent_system is None:
+            messagebox.showwarning("Agent System Not Ready", "The agent system is not yet initialized.")
+            return
+
+        if messagebox.askyesno("🧠 Confirm Clear Memories",
+                             "Are you sure you want to clear all agent memories from memory.txt?\n\nThis action cannot be undone."):
+            result = self.agent_system.clear_memory_file()
+            self.add_chat_message("🧠 System Memory", result, color=self.system_chat_color)
+            self.status_var.set(result)
+            # Optionally, refresh insights or other UI elements that might depend on memory
+            if hasattr(self, '_schedule_update_insights'):
+                self._schedule_update_insights()
 
     def show_project_stats(self):
         """Show detailed project statistics"""
