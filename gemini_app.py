@@ -1,4 +1,3 @@
-
 import os
 import threading
 import queue
@@ -15,6 +14,8 @@ from pathlib import Path
 # Third-party imports
 from PIL import Image, ImageTk
 
+from long_term_memory import LongTermMemory # Added
+
 # pip install google-genai Pillow
 try:
     from google import genai
@@ -22,6 +23,14 @@ try:
     GENAI_IMPORTED = True
 except ImportError:
     GENAI_IMPORTED = False
+
+class PlanStep:
+    def __init__(self, thought: str, command: str):
+        self.thought = thought
+        self.command = command
+
+    def __repr__(self):
+        return f"PlanStep(thought='{self.thought}', command='{self.command}')"
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -45,6 +54,9 @@ You operate in a headless environment with full vision capabilities. You can ana
 - `delete_file(path)`: Deletes a file or directory.
 - `run_command(command)`: Executes a shell command in the project directory.
 - `generate_image(path, prompt)`: Generates an image using AI based on a text prompt.
+- `remember(text_content: STRING)`: Stores the given text content into long-term memory. Useful for remembering facts, user preferences, or important information for future reference.
+- `recall(query_text: STRING, max_results: INT = 5)`: Retrieves relevant information from long-term memory based on the query text. Returns up to `max_results` (default 5).
+- `rename_file(old_path: STRING, new_path: STRING)`: Renames a file or directory from old_path to new_path. Paths must be relative to the project's root.
 
 **ENHANCED CAPABILITIES:**
 - **Vision Analysis**: Can analyze existing images to inform coding decisions
@@ -62,6 +74,7 @@ You operate in a headless environment with full vision capabilities. You can ana
 6. **COLLABORATION**: Work with Code Critic and Art Critic for optimal results.
 7. **QUALITY EXCELLENCE**: Aim for high-quality implementation as critique agents will grade your work.
 8. **IMAGE GENERATION VARIATIONS**: When tasked with generating an image, you MUST generate three distinct variations. For each variation, issue a separate `generate_image(path, prompt)` command. Use unique, descriptive filenames (e.g., `image_v1.png`, `image_v2.png`, `image_v3.png`). If possible, subtly vary the prompts for each of the three images to encourage diversity, while adhering to the core user request and any artistic guidance provided.
+9. **CODEBASE MODIFICATION**: If the user request, especially after refinement by the Prompt Enhancer, directs you to modify or improve this application's own codebase (e.g., `gemini_app.py`, `long_term_memory.py`, or other related Python files), you are authorized to use the `write_to_file` command to implement these changes. Analyze the request carefully, identify the target file(s) and specific code sections, and generate the complete, corrected code for the `write_to_file` command. Ensure your changes are precise and aim to fulfill the self-improvement request.
 
 **INTERACTION FLOW:**
 1. Implement user requests through commands with highest quality standards
@@ -193,6 +206,77 @@ Enhanced Prompt: "Create an HTML snippet for a button with the text 'Click Me'. 
 Now, enhance the following user prompt:
 """
 
+PLANNER_AGENT_PROMPT = """
+You are the PLANNER AGENT, a strategic AI responsible for creating step-by-step plans.
+Your task is to decompose a user's request into a precise JSON object containing a list of commands.
+The final step in your plan SHOULD be an `end_task()` command if the request implies a finite task that will be completed by the plan. If the request is conversational, a simple query, or part of an ongoing multi-stage process, `end_task()` might not be appropriate for this specific plan. Use your best judgment.
+
+1.  CONTEXT:
+    Current Project Files (summary):
+    {project_context}
+
+    Relevant Long-Term Memories:
+    {ltm_summary}
+
+2.  AVAILABLE TOOLS/COMMANDS:
+    You can use any of the following tools in your plan. Adhere strictly to their usage as described.
+    The paths for file operations should be relative to the project's root (e.g., 'filename.txt' or 'subdir/filename.txt').
+    {tool_list}
+
+3.  USER REQUEST:
+    "{user_request}"
+
+4.  YOUR TASK:
+    Your response MUST be a single, well-formed JSON object adhering to the structure specified below.
+    Analyze the user's request and the provided context.
+    Create a plan as a JSON object. The object MUST have a single key "plan", which is a list of steps.
+    Each step in the list is an object with two keys: "thought" and "command".
+    - "thought": Your reasoning for why this step is necessary. Be concise and focused on the immediate action.
+    - "command": The exact command to execute for this step, using one of the available tools.
+                 String arguments in commands must be enclosed in single quotes.
+                 Multiline content for `create_file` or `write_to_file` should use triple single quotes (e.g., `'''line1\nline2'''`).
+
+    For very complex requests (e.g., 'build an entire game from scratch'), your initial plan should focus on only the first 2-4 high-level, crucial steps. Do not try to plan out every detail of a large project in this first pass. Subsequent planning phases can refine these. Focus on clarity and executability for these initial steps.
+
+    If the user's request seems fully addressed by the planned steps, the final command in this plan segment should be `end_task()`.
+    If the request is simple and can be fulfilled by a single command, create a plan with just that one command (and `end_task()` if appropriate).
+    If the request is a question or does not require any tool usage, the "plan" list can be empty, or contain a single thought explaining why no actions are taken, possibly followed by `end_task()`.
+
+EXAMPLE RESPONSE (for creating a file and remembering):
+```json
+{{
+  "plan": [
+    {{
+      "thought": "Create the requested Python script.",
+      "command": "create_file('script.py', '#!/usr/bin/env python\n# My new script\nprint(\\'Hello, World!\\')')"
+    }},
+    {{
+      "thought": "Remember the user's preference.",
+      "command": "remember('User prefers Python for coding tasks in this project.')"
+    }},
+    {{
+      "thought": "Task complete for now.",
+      "command": "end_task()"
+    }}
+  ]
+}}
+```
+
+EXAMPLE RESPONSE (for a simple question where no tools are needed):
+```json
+{{
+  "plan": [
+    {{
+      "thought": "The user is asking a question. I will formulate an answer in my response without using tools. No actions needed.",
+      "command": "end_task()"
+    }}
+  ]
+}}
+```
+
+Begin your response now with the JSON object. Ensure the JSON is well-formed.
+"""
+
 def load_api_key():
     """Load API key from environment or config file"""
     if "GEMINI_API_KEY" in os.environ:
@@ -228,13 +312,219 @@ class EnhancedMultiAgentSystem:
         self.max_retry_attempts = 3
         self.current_attempt = 0
         
+        # Initialize LongTermMemory
+        ltm_file_path = VM_DIR / "system_ltm.json" # Define path for LTM data
+        self.ltm = LongTermMemory(file_path=str(ltm_file_path)) # Create instance
+
         self.command_handlers = {
             "create_file": self._create_file,
             "write_to_file": self._write_to_file,
             "delete_file": self._delete_file,
             "run_command": self._run_command,
             "generate_image": self.generate_image,
+            "remember": self._ltm_remember,
+            "recall": self._ltm_recall,
+            "rename_file": self._rename_file,
+            "end_task": self._end_task, # Added
         }
+
+    def _end_task(self):
+        return "✅ Task marked as complete by planner."
+
+    def _get_tool_descriptions(self):
+        descriptions = "Available commands:\n"
+        # Sort for consistent order in prompt
+        sorted_cmd_names = sorted(self.command_handlers.keys())
+
+        for cmd_name in sorted_cmd_names:
+            # Future: Could fetch detailed descriptions if stored with handlers
+            # For now, just list names and basic placeholders for args
+            if cmd_name == "create_file":
+                desc = "create_file(path: STRING, content: STRING)"
+            elif cmd_name == "write_to_file":
+                desc = "write_to_file(path: STRING, content: STRING)"
+            elif cmd_name == "delete_file":
+                desc = "delete_file(path: STRING)"
+            elif cmd_name == "run_command":
+                desc = "run_command(command: STRING)"
+            elif cmd_name == "generate_image":
+                desc = "generate_image(path: STRING, prompt: STRING)"
+            elif cmd_name == "remember":
+                desc = "remember(text_content: STRING)"
+            elif cmd_name == "recall":
+                desc = "recall(query_text: STRING, max_results: INT = 5)"
+            elif cmd_name == "rename_file":
+                desc = "rename_file(old_path: STRING, new_path: STRING)"
+            elif cmd_name == "end_task":
+                desc = "end_task()"
+            else:
+                desc = f"{cmd_name}(...)" # Generic placeholder
+            descriptions += f"- `{desc}`\n"
+
+        # Ensure end_task is mentioned if planner uses it, even if somehow missed by loop (defensive)
+        # Given the explicit add to command_handlers and sorted loop, this check might be redundant
+        # but doesn't hurt.
+        if "end_task" not in sorted_cmd_names:
+             if not any("end_task()" in line for line in descriptions.splitlines()):
+                 descriptions += "- `end_task()`: Signifies the task is complete.\n"
+        return descriptions.strip()
+
+    def _call_planner_llm(self, current_user_prompt: str, project_context_str: str, ltm_summary_str: str, tool_descriptions_str: str):
+        if not self.client:
+            err_msg = "Planner Error: LLM client not configured."
+            self.error_context.append(err_msg)
+            self._log_interaction("planner_client_error", err_msg)
+            return None
+
+        import json
+        import re
+
+        formatted_prompt = PLANNER_AGENT_PROMPT.format(
+            user_request=current_user_prompt,
+            project_context=project_context_str,
+            ltm_summary=ltm_summary_str,
+            tool_list=tool_descriptions_str
+        )
+
+        self._log_interaction("planner_prompt", formatted_prompt)
+
+        try:
+            response = self.client.models.generate_content(
+                model=TEXT_MODEL_NAME,
+                contents=[formatted_prompt]
+            )
+            raw_response_text = ""
+            if hasattr(response, 'parts') and response.parts:
+                for part in response.parts:
+                    if hasattr(part, 'text'):
+                        raw_response_text += part.text
+            elif hasattr(response, 'text'):
+                raw_response_text = response.text
+            else:
+                err_msg = "Planner Error: LLM response structure not as expected (missing 'parts' or 'text')."
+                self.error_context.append(err_msg)
+                self._log_interaction("planner_llm_response_format_error", f"{err_msg} Response: {str(response)[:200]}")
+                return None
+
+            self._log_interaction("planner_raw_response", raw_response_text)
+
+            json_str = raw_response_text
+            json_match = re.search(r"```json\s*(\{.*?\})\s*```", raw_response_text, re.DOTALL | re.IGNORECASE)
+            if json_match:
+                json_str = json_match.group(1)
+            else:
+                first_brace = raw_response_text.find('{')
+                last_brace = raw_response_text.rfind('}')
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    json_str = raw_response_text[first_brace:last_brace+1]
+                else:
+                    warn_msg = f"Planner Warning: No clear JSON block or structure found in response. Will attempt to parse raw text. Snippet: {raw_response_text[:200]}"
+                    self.error_context.append(warn_msg)
+                    self._log_interaction("planner_json_extraction_warning", warn_msg)
+
+            try:
+                parsed_json = json.loads(json_str)
+                if isinstance(parsed_json, dict) and "plan" in parsed_json and isinstance(parsed_json["plan"], list):
+                    plan_steps_data = parsed_json["plan"]
+                    plan_objects = []
+                    for i, step_data in enumerate(plan_steps_data):
+                        if isinstance(step_data, dict) and "thought" in step_data and "command" in step_data:
+                            plan_objects.append(PlanStep(thought=str(step_data["thought"]), command=str(step_data["command"])))
+                        else:
+                            err_msg = f"Planner Error: Invalid step data format in plan at index {i}. Step data (snippet): {str(step_data)[:200]}"
+                            self.error_context.append(err_msg)
+                            self._log_interaction("planner_plan_step_format_error", err_msg)
+                            # Continue processing other steps, effectively skipping this invalid one.
+
+                    self._log_interaction("planner_parsed_plan", [repr(p) for p in plan_objects])
+                    return plan_objects # Return potentially partial plan if some steps were invalid
+                else:
+                    err_msg = f"Planner Error: JSON response is not in the expected structure (e.g., missing 'plan' list or not a dict). Parsed JSON (snippet): {str(parsed_json)[:300]}"
+                    self.error_context.append(err_msg)
+                    self._log_interaction("planner_json_structure_error", f"{err_msg}. Raw response (snippet): {raw_response_text[:200]}")
+                    return None
+            except json.JSONDecodeError as e:
+                err_msg = f"Planner Error: Failed to decode JSON response. Error: {e}. JSON string attempted (snippet): {json_str[:300]}"
+                self.error_context.append(err_msg)
+                self._log_interaction("planner_json_decode_error", f"{err_msg}. Raw response (snippet): {raw_response_text[:200]}")
+                return None
+
+        except Exception as e:
+            error_message = f"Planner Error: LLM API call or initial response processing failed. Type: {type(e).__name__}, Error: {e}"
+            self.error_context.append(error_message)
+            self._log_interaction("planner_llm_api_call_error", error_message)
+            return None
+
+    def _rename_file(self, old_path_str: str, new_path_str: str):
+        if not isinstance(old_path_str, str) or not isinstance(new_path_str, str):
+            return "❌ Error: old_path and new_path for 'rename_file' command must be strings."
+
+        old_filepath = self._safe_path(old_path_str)
+        new_filepath = self._safe_path(new_path_str)
+
+        if not old_filepath:
+            return f"❌ Invalid or unsafe old path: {old_path_str}"
+        if not new_filepath:
+            return f"❌ Invalid or unsafe new path: {new_path_str}"
+
+        if not old_filepath.exists():
+            return f"❌ Error: Source path does not exist: {old_path_str}"
+        if new_filepath.exists():
+            return f"❌ Error: Destination path already exists: {new_path_str}"
+
+        # Ensure parent directory of the new path exists, only if it's different from old path's parent
+        # and the new path is not just a rename in the same directory.
+        if new_filepath.parent != old_filepath.parent:
+            try:
+                new_filepath.parent.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                error_msg = f"❌ Error creating parent directory for {new_path_str}: {e}"
+                self.error_context.append(error_msg)
+                return error_msg
+
+        try:
+            old_filepath.rename(new_filepath)
+            # Update project context recent changes if needed, similar to other file ops
+            self.project_context["recent_changes"].append({
+                "command": "rename_file",
+                "args": [old_path_str, new_path_str],
+                "timestamp": time.time()
+            })
+            return f"✅ Renamed: {old_path_str} to {new_path_str}"
+        except Exception as e:
+            error_msg = f"❌ Error renaming {old_path_str} to {new_path_str}: {e}"
+            self.error_context.append(error_msg)
+            return error_msg
+
+    def _ltm_remember(self, text_content: str):
+        if not isinstance(text_content, str):
+            return "❌ Error: Content for 'remember' command must be a string."
+        try:
+            return self.ltm.add_memory(text_content)
+        except Exception as e:
+            self.error_context.append(f"LTM remember error: {e}")
+            return f"❌ Error remembering content: {e}"
+
+    def _ltm_recall(self, query_text: str, max_results: str = "5"): # max_results from LLM might be string
+        if not isinstance(query_text, str):
+            return "❌ Error: Query text for 'recall' command must be a string."
+        try:
+            num_results = int(max_results)
+        except ValueError:
+            return "❌ Error: max_results for 'recall' command must be an integer."
+
+        try:
+            memories = self.ltm.retrieve_relevant_memories(query_text, max_results=num_results)
+            if memories:
+                response_lines = ["Retrieved memories:"]
+                for i, memory in enumerate(memories):
+                    response_lines.append(f"{i+1}. [{memory.timestamp}] {memory.content}")
+                return "\n".join(response_lines)
+            else:
+                return f"No relevant memories found for query: '{query_text}'"
+        except Exception as e:
+            self.error_context.append(f"LTM recall error: {e}")
+            return f"❌ Error recalling memories for query '{query_text}': {e}"
 
     def _get_enhanced_prompt(self, user_prompt):
         """Calls the PROMPT_ENHANCER_AGENT to refine the user's prompt."""
@@ -266,6 +556,54 @@ class EnhancedMultiAgentSystem:
             enhanced_user_prompt = original_user_prompt
             yield {"type": "system", "content": "✨ Prompt enhancer disabled. Using original prompt."}
 
+        # === CALL PLANNER ===
+        yield {"type": "system", "content": "🗺️ Calling Planner Agent..."}
+
+        # Gather context for planner
+        project_context_str = self._get_project_summary() # Or a more detailed file listing if preferred
+        # For LTM summary, retrieve and format relevant memories
+        ltm_query_prompt = enhanced_user_prompt # Use the (potentially enhanced) user prompt for LTM query
+        relevant_ltm_entries = self.ltm.retrieve_relevant_memories(ltm_query_prompt, max_results=5)
+        ltm_summary_str = "No specific long-term memories found for this request."
+        if relevant_ltm_entries:
+            ltm_summary_str = "Relevant Long-Term Memories:\n"
+            for mem in relevant_ltm_entries:
+                ltm_summary_str += f"- \"{mem.content}\" (Stored: {mem.timestamp})\n"
+
+        tool_descriptions_str = self._get_tool_descriptions()
+
+        plan_steps = self._call_planner_llm(
+            enhanced_user_prompt, # Pass the possibly enhanced prompt to the planner
+            project_context_str,
+            ltm_summary_str,
+            tool_descriptions_str
+        )
+
+        current_main_coder_prompt = enhanced_user_prompt # Default if no plan or prepending
+
+        if plan_steps:
+            yield {"type": "system", "content": f"📝 Planner proposed {len(plan_steps)} steps."}
+            # Yield the plan for UI display (convert PlanStep objects to dicts for JSON serialization if needed by UI)
+            plan_for_ui = [{"thought": step.thought, "command": step.command} for step in plan_steps]
+            yield {"type": "plan", "content": plan_for_ui } # Assuming UI can handle this type
+
+            # Prepend plan to the main coder prompt (simpler initial integration)
+            plan_summary_for_coder = "\n**GENERATED PLAN (Follow this plan carefully):**\n"
+            for i, step in enumerate(plan_steps):
+                plan_summary_for_coder += f"{i+1}. Thought: {step.thought}\n   Command: `{step.command}`\n"
+
+            # Prepend to the existing enhanced_user_prompt for the main coder
+            current_main_coder_prompt = f"{plan_summary_for_coder}\nBased on the plan above, and my original request (if needed for full context: '{enhanced_user_prompt}'), please provide the necessary commands to execute the next action(s) from the plan. If the plan includes an `end_task()` for the final step, ensure you output that command when all other planned actions are complete."
+            self._log_interaction("planner_guidance_to_coder", current_main_coder_prompt)
+            yield {"type": "system", "content": "🧠 Plan will be used to guide the Main Coder Agent."}
+
+        elif plan_steps is None: # Planner call failed or returned None
+            yield {"type": "error", "content": "Planner failed to generate a plan. Proceeding with original prompt for Main Coder."}
+            # current_main_coder_prompt remains enhanced_user_prompt
+        else: # plan_steps is an empty list
+            yield {"type": "system", "content": "ℹ️ Planner returned an empty plan (e.g., for a conversational query). Proceeding with original prompt for Main Coder."}
+            # current_main_coder_prompt remains enhanced_user_prompt
+
         proactive_art_advice = None
         # Check if proactive art guidance is needed
         if self._should_invoke_art_critic(enhanced_user_prompt, "", []): # Pass empty values for main_response and implementation_results
@@ -277,6 +615,8 @@ class EnhancedMultiAgentSystem:
                 # This method is not yet implemented, so we'll wrap it in a try-except
                 # and proceed if it's not found, as per subtask instructions.
                 if hasattr(self, "_get_proactive_art_guidance"):
+                    # Proactive art advice should be based on the core intent, which is in enhanced_user_prompt,
+                    # not the plan-augmented current_main_coder_prompt.
                     proactive_art_advice = self._get_proactive_art_guidance(enhanced_user_prompt)
                     if proactive_art_advice:
                         yield {"type": "agent", "agent": "🎨 Art Critic (Proactive)", "content": proactive_art_advice}
@@ -284,9 +624,6 @@ class EnhancedMultiAgentSystem:
                     yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented."}
             except AttributeError:
                  yield {"type": "system", "content": "🔧 Note: _get_proactive_art_guidance method not yet implemented (AttributeError)."}
-
-
-        current_main_coder_prompt = enhanced_user_prompt
 
         # Reset attempt counter for new interactions
         self.current_attempt = 0
@@ -729,6 +1066,28 @@ Focus on actionable improvements that leverage all three agent perspectives.
         prompt_parts = [{"text": f"{system_prompt}\n\n**PROJECT STATUS:**\n"}]
         if proactive_art_advice:
             prompt_parts.append({"text": f"\n**PROACTIVE ART GUIDANCE:**\n{proactive_art_advice}\n"})
+
+        # === ADD LTM CONTEXT START ===
+        try:
+            # Retrieve relevant memories based on the core user prompt
+            # Use the original user_prompt that was passed to run_enhanced_interaction,
+            # which might be different from the potentially augmented 'user_prompt' argument of this function if retrying.
+            # For simplicity here, we'll assume 'user_prompt' arg is suitable for LTM query.
+            relevant_memories = self.ltm.retrieve_relevant_memories(user_prompt, max_results=3) # Query LTM
+            if relevant_memories:
+                prompt_parts.append({"text": "\n**RELEVANT LONG-TERM MEMORIES:**\n"})
+                for mem in relevant_memories:
+                    # Appending each memory as a separate text part for clarity if needed,
+                    # or concatenate into one string.
+                    prompt_parts.append({"text": f"- \"{mem.content}\" (Stored: {mem.timestamp})\n"})
+            # else:
+                # Optionally add a note if no memories found, or just skip.
+                # prompt_parts.append({"text": "\n(No specific long-term memories deemed relevant for this immediate request.)\n"})
+        except Exception as e:
+            # Log or handle error in LTM retrieval if necessary, but don't let it stop prompt building.
+            self.error_context.append(f"LTM context retrieval error: {e}")
+            prompt_parts.append({"text": "\n(Error retrieving long-term memories.)\n"})
+        # === ADD LTM CONTEXT END ===
 
         # Add current files with content
         if VM_DIR.exists():
@@ -1370,6 +1729,8 @@ class EnhancedGeminiIDE(tk.Tk):
         file_menu.add_separator()
         file_menu.add_command(label="🧹 Clear Chat", command=self.clear_chat)
         file_menu.add_command(label="📊 Project Stats", command=self.show_project_stats)
+        file_menu.add_separator()
+        file_menu.add_command(label="🧠 Refresh LTM View", command=self._refresh_ltm_view)
         menubar.add_cascade(label="File", menu=file_menu)
 
         # Agents menu
@@ -1506,6 +1867,26 @@ class EnhancedGeminiIDE(tk.Tk):
         self.insights.pack(fill=tk.BOTH, expand=True)
         self.insights.frame.config(background=self.bg_color_dark)
         self.notebook.add(insights_frame, text="📊 Project Insights")
+
+        # LTM Viewer Tab
+        ltm_frame = ttk.Frame(self.notebook)
+        self.ltm_viewer = scrolledtext.ScrolledText(
+            ltm_frame,
+            wrap=tk.WORD,
+            font=("Segoe UI", 10),
+            padx=15,
+            pady=15,
+            state="disabled", # Initially disabled, content will be loaded
+            bg=self.bg_color_medium,
+            fg=self.fg_color_light,
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=self.border_color
+        )
+        self.ltm_viewer.pack(fill=tk.BOTH, expand=True)
+        self.ltm_viewer.frame.config(background=self.bg_color_dark)
+        self.notebook.add(ltm_frame, text="🧠 Long-Term Memory")
 
         # Enhanced input area
         input_frame = ttk.Frame(right_frame)
@@ -1689,6 +2070,7 @@ class EnhancedGeminiIDE(tk.Tk):
             self.add_chat_message("System", "🚀 Enhanced Multi-Agent System ready!\n\n🤖 Main Coder Agent - Vision-enabled implementation\n📊 Code Critic Agent - Deep analysis & security\n🎨 Art Critic Agent - Visual analysis & design")
             self._draw_enhancer_toggle_switch() # Initial draw of the custom toggle switch
             self.update_agent_insights()
+            self._refresh_ltm_view() # Initial LTM view population
         except Exception as e:
             self.status_var.set(f"❌ Agent error: {str(e)}")
             self.add_chat_message("System", f"Agent configuration failed: {str(e)}", "#ff0000")
@@ -1798,11 +2180,44 @@ class EnhancedGeminiIDE(tk.Tk):
                     self.main_status.config(foreground=self.agent_status_inactive_color)
                     self.critic_status.config(foreground=self.agent_status_inactive_color)
                     self.art_status.config(foreground=self.agent_status_inactive_color)
+                    self._refresh_ltm_view() # Refresh LTM view after command processing
 
         except queue.Empty:
             pass
 
         self.after(100, self._process_messages)
+
+    def _format_plan_for_chat(self, plan_steps_list_of_dicts):
+        """Formats the plan (list of dicts) for display in chat."""
+        if not plan_steps_list_of_dicts:
+            return "No plan steps."
+        formatted_str = ""
+        for i, step in enumerate(plan_steps_list_of_dicts):
+            formatted_str += f"{i+1}. Thought: {step.get('thought', 'N/A')}\n"
+            formatted_str += f"   Command: `{step.get('command', 'N/A')}`\n"
+        return formatted_str.strip()
+
+    def _refresh_ltm_view(self):
+        if hasattr(self, 'agent_system') and hasattr(self.agent_system, 'ltm'):
+            self.ltm_viewer.config(state="normal")
+            self.ltm_viewer.delete("1.0", tk.END)
+
+            # The LTM's memories are already loaded by its init or by add_memory
+            # We can sort them here for display if desired (e.g., by timestamp)
+            sorted_memories = sorted(self.agent_system.ltm.memories, key=lambda m: m.timestamp, reverse=True)
+
+            if sorted_memories:
+                self.ltm_viewer.insert(tk.END, "🧠 Stored Long-Term Memories (Most Recent First):\n\n")
+                for memory in sorted_memories:
+                    self.ltm_viewer.insert(tk.END, f"[{memory.timestamp}]\n{memory.content}\n{'-'*40}\n\n")
+            else:
+                self.ltm_viewer.insert(tk.END, "No long-term memories stored yet.")
+            self.ltm_viewer.config(state="disabled")
+        else:
+            self.ltm_viewer.config(state="normal")
+            self.ltm_viewer.delete("1.0", tk.END)
+            self.ltm_viewer.insert(tk.END, "LTM system not yet initialized or available.")
+            self.ltm_viewer.config(state="disabled")
 
     def display_enhanced_image(self, path):
         """Enhanced image display with metadata"""
@@ -2517,6 +2932,8 @@ class EnhancedGeminiIDE(tk.Tk):
                     self.main_status.config(foreground=self.agent_status_error_color)
                     self.critic_status.config(foreground=self.agent_status_error_color)
                     self.art_status.config(foreground=self.agent_status_error_color)
+                elif msg["type"] == "plan": # Handle new "plan" message type
+                    self.add_chat_message("🗺️ Planner", f"Proposed Plan:\n{self._format_plan_for_chat(msg['content'])}", "#0077be") # Example color
                 elif msg["type"] == "screenshot_success":
                     filename = msg["content"]
                     self._finalize_screenshot_processing(filename)
@@ -2550,6 +2967,16 @@ class EnhancedGeminiIDE(tk.Tk):
             pass
 
         self.after(100, self._process_messages)
+
+    def _format_plan_for_chat(self, plan_steps_list_of_dicts):
+        """Formats the plan (list of dicts) for display in chat."""
+        if not plan_steps_list_of_dicts:
+            return "No plan steps."
+        formatted_str = ""
+        for i, step in enumerate(plan_steps_list_of_dicts):
+            formatted_str += f"{i+1}. Thought: {step.get('thought', 'N/A')}\n"
+            formatted_str += f"   Command: `{step.get('command', 'N/A')}`\n"
+        return formatted_str.strip()
 
     def on_close(self):
         """Enhanced close handler"""
