@@ -42,7 +42,29 @@ You operate in a headless environment with full vision capabilities. The current
 
 **COMMANDS:**
 - `create_file(path, content)`: Creates a new text file with specified content.
-- `write_to_file(path, content)`: Overwrites an existing text file.
+- `write_to_file(path, content)`: Overwrites an existing text file with the provided `content`.
+    **CRITICAL FOR MULTI-LINE CONTENT (e.g., code):** The `content` argument string MUST be a valid Python string literal that `ast.literal_eval` can parse. This means:
+        1.  **Escape Backslashes**: Any backslash `\` in your actual content must be represented as `\\` in the string literal you generate.
+        2.  **Escape Quotes**: If using single quotes `'...'` for the content argument in your command, any single quote `'` inside your actual content must be escaped as `\'`. If using double quotes `"..."`, any double quote `"` inside your actual content must be escaped as `\"`.
+        3.  **Represent Newlines**: Actual newline characters in your content MUST be represented as `\n` within the string literal. Using a literal newline character in the string argument you generate for the command will likely cause a parsing error.
+
+    **STRONGLY RECOMMENDED FORMATTING EXAMPLE (Writing a Python script)**:
+    If you want to write the following Python code to `script.py`:
+    ```python
+    def greet():
+        print("Hello, Agent!")
+    greet()
+    # A comment with a ' quote.
+    ```
+    The command you generate **MUST** look like ONE of these (pay close attention to `\n` for newlines and escaped quotes like `\'` or `\"`):
+
+    Using single quotes for the `content` argument:
+    `write_to_file('script.py', 'def greet():\n    print("Hello, Agent!")\ngreet()\n# A comment with a \' quote.')`
+
+    Using double quotes for the `content` argument:
+    `write_to_file("script.py", "def greet():\n    print(\"Hello, Agent!\")\ngreet()\n# A comment with a ' quote.")`
+
+    **IMPORTANT**: Do NOT include literal multi-line blocks (using triple quotes) directly as the content argument string in the command you output. Instead, construct a single string literal with `\n` for newlines and escaped quotes as shown above. This is the safest way to ensure `ast.literal_eval` can parse it.
 - `delete_file(path)`: Deletes a file or directory.
 - `rename_file(old_path, new_path)`: Renames a file or directory.
 - `run_command(command)`: Executes a shell command in the project directory.
@@ -59,14 +81,27 @@ You operate in a headless environment with full vision capabilities. The current
 
 **RULES:**
 1. **COMMAND ONLY OUTPUT**: Your response must ONLY contain commands wrapped in backticks.
-2. **PROPER QUOTING**: All string arguments must be in single quotes.
-3. **MULTILINE CONTENT**: Use triple quotes for file content spanning multiple lines.
+2. **PROPER QUOTING FOR COMMAND ARGUMENTS**: All string arguments for commands (like `path` or `content` in `write_to_file`) must be enclosed in single quotes (`'...'`) or double quotes (`"..."`).
+3. **VALID COMMAND STRING ARGUMENTS (ESPECIALLY FOR `write_to_file` `content`)**:
+   All string arguments provided to commands MUST be valid Python string literals that `ast.literal_eval` can parse. This means special characters *within the data you are putting into these arguments* (like the actual code for `write_to_file`) must be correctly escaped.
+    - Newlines within the content MUST be represented as `\n`.
+    - Backslashes `\` within the content MUST be represented as `\\`.
+    - If using single quotes for the overall command argument (e.g., `'my_content_string'`), then any single quotes `'` *inside* `my_content_string` MUST be escaped as `\'`.
+    - If using double quotes for the overall command argument (e.g., `"my_content_string"`), then any double quotes `"` *inside* `my_content_string` MUST be escaped as `\"`.
+    - Refer to the detailed examples under the `write_to_file` command description.
 4. **NO COMMENTARY**: Never output explanatory text outside backticked commands.
 5. **VISUAL AWARENESS**: Consider existing images when making implementation decisions.
 6. **COLLABORATION**: Work with Code Critic and Art Critic for optimal results.
 7. **QUALITY EXCELLENCE**: Aim for high-quality implementation as critique agents will grade your work.
 8. **IMAGE GENERATION VARIATIONS**: When tasked with generating an image, you MUST generate three distinct variations. For each variation, issue a separate `generate_image(path, prompt)` command. Use unique, descriptive filenames (e.g., `image_v1.png`, `image_v2.png`, `image_v3.png`). If possible, subtly vary the prompts for each of the three images to encourage diversity, while adhering to the core user request and any artistic guidance provided.
 9. **USE RENAME_FILE**: Always use the `rename_file(old_path, new_path)` command for renaming files or directories. Do not use `run_command` with `mv` or `ren` for renaming.
+10. **PREFER SINGLE QUOTES FOR COMMAND ARGUMENTS**: While double quotes are acceptable if handled correctly, for consistency, prefer using single quotes for the string arguments of commands, e.g., `write_to_file('my_file.txt', 'File content with a single quote here: \' needs escaping.')`.
+11. **REQUESTING A RE-PLAN (USE EXTREMELY RARELY):**
+    In exceptional situations where you, after attempting to execute your assigned task, determine that the entire current plan is fundamentally flawed or impossible due to unforeseen critical issues that you cannot resolve (e.g., a core assumption of the plan is incorrect, a critical unresolvable dependency, or your actions have revealed information that invalidates the remaining planned steps), you may request a system re-plan.
+    To do this, ensure the VERY LAST LINE of your entire output is the exact directive:
+    `REQUEST_REPLAN: [Provide a concise but detailed reason explaining the critical issue and why the current plan needs to be re-evaluated from scratch. Include any new, relevant context.]`
+    For example: `REQUEST_REPLAN: The plan assumes 'module_X' can be installed, but it's incompatible with the existing 'module_Y' version, requiring a different overall approach to the task.`
+    **Use this directive only as a last resort when you cannot make further progress on the current plan.** Do not use it for routine errors or if you can attempt alternative commands.
 
 **INTERACTION FLOW:**
 1. Implement user requests through commands with highest quality standards
@@ -80,6 +115,29 @@ If your task is to "refine" an image or "improve an image based on feedback", yo
 2. **Adjust Your Prompt**: Modify your previous image generation prompt(s) or create new prompt(s) to directly address the points raised in the critique. For example, if the critique said "the colors are too dark," your new prompt should aim for brighter colors. If it said "the cat should be fluffier," enhance your description of the cat's fur.
 3. **Generate New Image(s)**: Use the `generate_image(path, prompt)` command to create one or two new variations of the image incorporating the suggested changes. Use new, distinct filenames for these refined images (e.g., `image_refined_v1.png`).
 4. **Reference Previous Attempt (Contextually)**: While you are generating a *new* image, your understanding of the critique will be based on the previous attempt. You don't need to explicitly state "this is version 2"; simply generate the improved image.
+
+**AUTONOMOUS HANDLING OF IMPROVEMENT/DEVELOPMENT TASKS:**
+When given a general task like "improve my game," "develop a data parser," or "enhance the UI," and the specific target (file or project) is unclear or non-existent:
+1.  **Initial Check**:
+    *   Review your current context (file listings are provided in the prompt).
+    *   If needed to understand the project structure better to find a relevant file, you can use `run_command('ls -R')` to explore the `vm/` directory.
+    *   Look for existing files or directory structures that match the user's request.
+2.  **Autonomous Creation if Target is Missing/Ambiguous**:
+    *   If no relevant target is found, or if the request is very general (e.g., "make a game" when no game files exist), you MUST autonomously create a simple, foundational version of the requested item.
+    *   **Examples of Foundational Items**:
+        *   For "improve my game" (and no game exists): Create a basic Pygame skeleton in a new file like `vm/default_game.py`. This skeleton should include a minimal game loop, window setup, and placeholder functions for `update()` and `draw()`.
+        *   For "develop a data parser" (no specific data or parser mentioned): Create a Python script like `vm/basic_parser.py`. This script should include a `main()` function, boilerplate for argument parsing (e.g., using `argparse`), and placeholder functions like `load_data(filepath)`, `parse_data(data)`, and `output_results(parsed_data)`.
+        *   For "enhance the UI" (no specific UI context): If existing project files suggest a framework (e.g., Tkinter in other Python files), create a new file (e.g., `vm/ui_module.py`) with a basic structure for that framework. If no framework is clear, create a simple HTML file (e.g., `vm/foundational_ui.html`) with a basic HTML structure (doctype, html, head, body tags).
+    *   You **MUST** use the `write_to_file(path, content)` command to save this foundational version. Remember to follow the critical rules for formatting the `content` argument, especially for multi-line code (using `\n` for newlines and escaping quotes/backslashes correctly).
+3.  **Log Your Autonomous Action (System Message - CRUCIAL)**:
+    *   Immediately after successfully creating the foundational item, you **MUST** output a plain text message (NOT a command, NOT in backticks) to inform the user about your autonomous action. This message must start with "System Message: ".
+    *   **Example System Messages**:
+        *   "System Message: No existing 'game' project was found. I have created a basic Pygame skeleton in 'vm/default_game.py'. I will now proceed to apply improvements to this file based on your request."
+        *   "System Message: The request 'develop a data parser' was general. I've created a foundational script 'vm/basic_parser.py' with placeholder functions. I will now add specific parsing logic to it."
+        *   "System Message: No specific UI was mentioned for enhancement. I have created a basic HTML structure in 'vm/foundational_ui.html'. I will now enhance this file."
+    *   This "System Message:" should appear in your output stream *before* any subsequent commands related to modifying or using this newly created foundational item.
+4.  **Proceed with Original Task**: After creating and logging the foundational item, proceed to apply the original "improvement," "development," or "enhancement" instructions to this newly created file. Your subsequent commands should target this new file.
+
 """
 
 CRITIC_AGENT_PROMPT = """You are the CODE CRITIQUE AGENT in an advanced multi-agent IDE system. The current date and time are provided in your context. Your enhanced role includes code review, security analysis, performance optimization, and GRADING the Main Coder's work. MainCoder can store and recall user preferences using `set_user_preference` and `get_user_preference` commands.
@@ -209,6 +267,15 @@ PLANNER_AGENT_PROMPT = """You are the PLANNER AGENT. The current date and time a
 
 **USER REQUEST ANALYSIS:**
 1.  **Understand Goal:** Deeply analyze the user's request to identify their true underlying goal.
+
+**HANDLING RE-PLANNING REQUESTS:**
+You may occasionally receive requests that are explicitly for 'RE-PLANNING'. These occur when a previous plan encountered a critical issue. Such requests will include:
+1.  The Original User Prompt.
+2.  The reason why a re-plan was requested by another agent.
+3.  Context about the prior attempt (e.g., actions taken, state reached).
+
+Your task in a re-planning scenario is to deeply analyze this feedback and the original goal. Formulate a *new, revised plan* that addresses the stated reasons for failure and provides a more robust path to achieving the user's objective. Do not simply repeat the failed plan.
+
 2.  **Agent Selection:** For each step, choose the most appropriate agent:
     *   `PersonaAgent`: For direct user interaction, simple conversational turns (e.g., "hello", "thanks"), answering questions about the system's state, the current plan, or agent capabilities (e.g., "What are you doing?", "What can ArtCritic do?"). If the user is asking a question *to the AI system itself* rather than requesting a task to be performed on the project, use PersonaAgent.
     *   `MainCoder`: For coding tasks (generating scripts, web pages, etc.), file operations (create, write, delete, rename), image generation, and managing user preferences (`set_user_preference`, `get_user_preference`).
@@ -1091,6 +1158,9 @@ class EnhancedMultiAgentSystem:
                 yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "active"}
 
             try:
+                replan_requested = False
+                replan_reason = ""
+
                 if agent_name_from_plan == "PlannerAgent":
                     yield {"type": "agent", "agent": "✨ Assistant", "content": instruction}
                     self._log_interaction("planner_direct_response", instruction)
@@ -1102,30 +1172,26 @@ class EnhancedMultiAgentSystem:
 
                     if not self.prompt_enhancer_enabled:
                         yield {"type": "system", "content": "ℹ️ Skipping planned PromptEnhancer step as it's globally disabled. Using input as output."}
-                        # The 'instruction' for this step was meant for the enhancer.
-                        # If enhancer is off, this instruction itself becomes the output of this skipped step.
                         previous_step_output = instruction
                         self._log_interaction("skipped_prompt_enhancer_step", f"Instruction for disabled enhancer: {instruction}")
                     else:
-                        # The 'instruction' from the plan IS the text to be enhanced for this step.
                         text_to_enhance = instruction
-                        # _handle_prompt_enhancement is a generator that yields UI messages and returns the final string.
-                        # `yield from` correctly captures the return value.
                         previous_step_output = yield from self._handle_prompt_enhancement(text_to_enhance)
-                    step_output_data = previous_step_output # Ensure step_output_data is set
+                    step_output_data = previous_step_output
 
                 elif agent_name_from_plan == "ProactiveArtAgent":
-                    # agent_name_for_status is "art_critic_proactive"
-                    # Active status update is already yielded
                     step_output_data = yield from self._handle_proactive_art_guidance(instruction)
 
                 elif agent_name_from_plan == "PersonaAgent":
                     persona_agent_full_text = ""
-                    for message_dict in self._execute_persona_agent_response(instruction):
-                        yield message_dict # Yield UI messages immediately
+                    # _execute_persona_agent_response now yields UI messages directly
+                    for message_dict in self._execute_persona_agent_response(
+                        instruction, plan_steps=plan_steps, current_step_index=i
+                    ):
+                        yield message_dict
                         if message_dict.get("type") == "agent_stream_chunk" and message_dict.get("agent") == "✨ Persona Agent":
                             persona_agent_full_text += message_dict.get("content", "")
-                    step_output_data = persona_agent_full_text # Store the full response
+                    step_output_data = persona_agent_full_text
 
                 elif agent_name_from_plan == "MainCoder":
                     art_guidance_for_coder = None
@@ -1135,36 +1201,41 @@ class EnhancedMultiAgentSystem:
                         "mood and tone" in previous_step_output.lower()):
                         art_guidance_for_coder = previous_step_output
 
-                    # Check if this MainCoder step is for refinement based on ArtCritic feedback
                     current_instruction_for_coder = instruction
                     if isinstance(previous_step_output, list) and previous_step_output and \
                        isinstance(previous_step_output[0], dict) and "critique_text" in previous_step_output[0] and \
                        "{ART_CRITIC_FEEDBACK_PLACEHOLDER}" in current_instruction_for_coder:
-
-                        critique_text_to_inject = ""
-                        for art_crit_item in previous_step_output: # previous_step_output is all_art_critiques_results
-                            if art_crit_item.get("critique_text"):
-                                critique_text_to_inject += f"Critique for '{art_crit_item.get('image_path', 'image')}':\n{art_crit_item['critique_text']}\n\n"
-
+                        critique_text_to_inject = "".join(
+                            f"Critique for '{art_crit_item.get('image_path', 'image')}':\n{art_crit_item['critique_text']}\n\n"
+                            for art_crit_item in previous_step_output if art_crit_item.get("critique_text")
+                        )
                         if critique_text_to_inject:
                             current_instruction_for_coder = current_instruction_for_coder.replace("{ART_CRITIC_FEEDBACK_PLACEHOLDER}", critique_text_to_inject.strip())
-                            yield {"type": "system", "content": f"📝 Injected ArtCritic feedback into MainCoder instruction for refinement."}
-
+                            yield {"type": "system", "content": "📝 Injected ArtCritic feedback into MainCoder instruction for refinement."}
 
                     main_coder_output_dict = yield from self._execute_main_coder_phase(
-                        coder_instruction=current_instruction_for_coder, # Potentially modified instruction
+                        coder_instruction=current_instruction_for_coder,
                         art_guidance=art_guidance_for_coder
                     )
                     step_output_data = main_coder_output_dict
 
+                    # Check for re-plan request from MainCoder
+                    if isinstance(step_output_data, dict) and "text_response" in step_output_data:
+                        response_text = step_output_data["text_response"]
+                        lines = response_text.strip().splitlines()
+                        if lines and lines[-1].startswith("REQUEST_REPLAN:"):
+                            replan_requested = True
+                            replan_reason = lines[-1][len("REQUEST_REPLAN:"):].strip()
+                            step_output_data["text_response"] = "\n".join(lines[:-1]).strip() # Remove directive from output
+                            # Also update implementation_results if any command output this as part of its string.
+                            # This is less likely as commands return structured data.
+                            # For now, assume it's primarily in the raw text_response.
+
                 elif agent_name_from_plan == "CodeCritic":
                     if isinstance(previous_step_output, dict) and "text_response" in previous_step_output:
-                        code_critique_output_dict = yield from self._get_code_critique_results(
-                            original_user_request=original_user_prompt,
-                            main_coder_output=previous_step_output,
-                            critique_instruction=instruction
+                        step_output_data = yield from self._get_code_critique_results(
+                            original_user_prompt, previous_step_output, instruction
                         )
-                        step_output_data = code_critique_output_dict
                     else:
                         yield {"type": "error", "content": "CodeCritic called without valid MainCoder output from previous step."}
                         step_output_data = {"error": "Missing valid input for CodeCritic."}
@@ -1172,13 +1243,9 @@ class EnhancedMultiAgentSystem:
                 elif agent_name_from_plan == "ArtCritic":
                     if isinstance(previous_step_output, dict):
                         images_to_critique = previous_step_output.get("generated_image_paths", [])
-                        art_critique_output_list = yield from self._get_art_critique_results(
-                            original_user_request=original_user_prompt,
-                            main_coder_output=previous_step_output,
-                            art_critique_instruction=instruction,
-                            generated_image_paths=images_to_critique
+                        step_output_data = yield from self._get_art_critique_results(
+                            original_user_prompt, previous_step_output, instruction, images_to_critique
                         )
-                        step_output_data = art_critique_output_list
                     else:
                         yield {"type": "error", "content": "ArtCritic called without valid MainCoder output from previous step."}
                         step_output_data = {"error": "Missing valid input for ArtCritic."}
@@ -1187,18 +1254,50 @@ class EnhancedMultiAgentSystem:
                     yield {"type": "error", "content": f"Unknown agent in plan: {agent_name_from_plan}. Skipping step."}
                     step_output_data = f"Error: Unknown agent {agent_name_from_plan}"
 
+                # --- Re-plan logic ---
+                if replan_requested:
+                    yield {"type": "system", "content": f"🤖 Agent {agent_name_from_plan} requested a re-plan. Reason: {replan_reason}. Initiating new planning cycle..."}
+
+                    # Summarize recent changes for the new planner prompt
+                    recent_changes_summary = "No recent changes logged."
+                    if hasattr(self, 'project_context') and self.project_context.get("recent_changes"):
+                        changes_to_log = self.project_context["recent_changes"][-5:] # Last 5 changes for context
+                        formatted_changes = [f"- {ch['command']}: {str(ch['args'])[:100]}" for ch in changes_to_log]
+                        if formatted_changes:
+                            recent_changes_summary = "\n".join(formatted_changes)
+
+                    new_planner_prompt = (
+                        f"RE-PLANNING REQUESTED. Original User Prompt: '{original_user_prompt}'.\n"
+                        f"Reason for Re-plan by {agent_name_from_plan}: '{replan_reason}'.\n"
+                        f"Context of recent system actions that led to this:\n{recent_changes_summary}\n\n"
+                        f"Please formulate a new plan to achieve the original user prompt, taking this new context and reason into account. Avoid the previous pitfalls."
+                    )
+
+                    new_plan_steps = self._get_plan_from_planner(new_planner_prompt)
+                    if new_plan_steps:
+                        plan_steps = new_plan_steps
+                        i = -1 # Reset loop to start from the beginning of the new plan
+                        previous_step_output = None # Reset previous output
+                        yield {"type": "system", "content": f"📜 New plan received with {len(plan_steps)} steps. Restarting execution..."}
+                        if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
+                             yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"} # Current agent inactive
+                        continue # Restart the loop with the new plan
+                    else:
+                        yield {"type": "error", "content": "Planner failed to generate a new plan after re-plan request. Stopping."}
+                        break # Exit the loop
+
                 if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                     yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
 
                 previous_step_output = step_output_data
 
-                if is_final_step:
+                if is_final_step and not replan_requested: # Only consider final if no re-plan is pending
                     yield {"type": "system", "content": f"✅ Final step ({agent_name_from_plan}) completed."}
 
             except Exception as e:
-                if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
+                if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]: # Ensure status is reset on error
                     yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
-                error_msg = f"Error during step execution ({agent_name_from_plan}): {type(e).__name__} - {e}"
+                error_msg = f"Error during step execution ({agent_name_from_plan}): {type(e).__name__} - {str(e)}\nFull Traceback:\n{traceback.format_exc()}"
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": error_msg}
                 previous_step_output = {"error": error_msg}
