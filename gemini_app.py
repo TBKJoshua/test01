@@ -1261,69 +1261,65 @@ class EnhancedMultiAgentSystem:
         yield {"type": "system", "content": f"📜 Planner generated {len(plan_steps)} steps. Starting execution..."}
         
         previous_step_output = None
+        i = 0 # Initialize loop counter
 
-        for i, step in enumerate(plan_steps):
+        # Loop control variables for final message
+        completed_normally = False
+        replan_failed_to_get_new_steps = False
+
+        while i < len(plan_steps):
+            step = plan_steps[i]
             agent_name_from_plan = step.get('agent_name')
             instruction = step.get('instruction')
             is_final_step = step.get('is_final_step', False)
 
             if not agent_name_from_plan or not instruction:
                 yield {"type": "error", "content": f"Planner returned an invalid step (missing agent_name or instruction): {step}. Skipping."}
+                i += 1
                 continue
 
             yield {"type": "system", "content": f"▶️ Executing Step {i+1}/{len(plan_steps)}: {agent_name_from_plan} - Task: '{instruction[:100]}{'...' if len(instruction) > 100 else ''}'"}
             
-            step_output_data = None
-            
+            step_output_data = None # Ensure initialized for each step
             agent_name_for_status = ""
-            if agent_name_from_plan == "MainCoder":
-                agent_name_for_status = "main_coder"
-            elif agent_name_from_plan == "CodeCritic":
-                agent_name_for_status = "code_critic"
-            elif agent_name_from_plan == "ArtCritic":
-                agent_name_for_status = "art_critic"
-            elif agent_name_from_plan == "PromptEnhancer":
-                agent_name_for_status = "prompt_enhancer"
-            elif agent_name_from_plan == "PlannerAgent":
-                agent_name_for_status = "planner_agent_direct"
-            elif agent_name_from_plan == "ProactiveArtAgent":
-                agent_name_for_status = "art_critic_proactive"
-            elif agent_name_from_plan == "PersonaAgent":
-                agent_name_for_status = "persona_agent"
-            else:
-                agent_name_for_status = "unknown_agent"
+            # Determine agent_name_for_status based on agent_name_from_plan
+            if agent_name_from_plan == "MainCoder": agent_name_for_status = "main_coder"
+            elif agent_name_from_plan == "CodeCritic": agent_name_for_status = "code_critic"
+            elif agent_name_from_plan == "ArtCritic": agent_name_for_status = "art_critic"
+            elif agent_name_from_plan == "PromptEnhancer": agent_name_for_status = "prompt_enhancer"
+            elif agent_name_from_plan == "PlannerAgent": agent_name_for_status = "planner_agent_direct"
+            elif agent_name_from_plan == "ProactiveArtAgent": agent_name_for_status = "art_critic_proactive"
+            elif agent_name_from_plan == "PersonaAgent": agent_name_for_status = "persona_agent"
+            else: agent_name_for_status = "unknown_agent"
 
             if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                 yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "active"}
 
-            try:
-                replan_requested = False
-                replan_reason = ""
+            replan_requested_this_step = False # Renamed to avoid conflict with outer scope if any
 
+            try:
                 if agent_name_from_plan == "PlannerAgent":
                     yield {"type": "agent", "agent": "✨ Assistant", "content": instruction}
                     self._log_interaction("planner_direct_response", instruction)
                     step_output_data = instruction
                 
                 elif agent_name_from_plan == "PromptEnhancer":
-                    # agent_name_for_status is "prompt_enhancer"
-                    # Active status update is already yielded before this try block
-
                     if not self.prompt_enhancer_enabled:
                         yield {"type": "system", "content": "ℹ️ Skipping planned PromptEnhancer step as it's globally disabled. Using input as output."}
-                        previous_step_output = instruction
+                        # previous_step_output = instruction # This was incorrect, should be step_output_data
+                        step_output_data = instruction
                         self._log_interaction("skipped_prompt_enhancer_step", f"Instruction for disabled enhancer: {instruction}")
                     else:
                         text_to_enhance = instruction
-                        previous_step_output = yield from self._handle_prompt_enhancement(text_to_enhance)
-                    step_output_data = previous_step_output
+                        # previous_step_output = yield from self._handle_prompt_enhancement(text_to_enhance) # This was incorrect
+                        step_output_data = yield from self._handle_prompt_enhancement(text_to_enhance)
+                    # step_output_data = previous_step_output # This was redundant/incorrect
 
                 elif agent_name_from_plan == "ProactiveArtAgent":
                     step_output_data = yield from self._handle_proactive_art_guidance(instruction)
 
                 elif agent_name_from_plan == "PersonaAgent":
                     persona_agent_full_text = ""
-                    # _execute_persona_agent_response now yields UI messages directly
                     for message_dict in self._execute_persona_agent_response(
                         instruction, plan_steps=plan_steps, current_step_index=i
                     ):
@@ -1358,17 +1354,13 @@ class EnhancedMultiAgentSystem:
                     )
                     step_output_data = main_coder_output_dict
 
-                    # Check for re-plan request from MainCoder
                     if isinstance(step_output_data, dict) and "text_response" in step_output_data:
                         response_text = step_output_data["text_response"]
                         lines = response_text.strip().splitlines()
                         if lines and lines[-1].startswith("REQUEST_REPLAN:"):
-                            replan_requested = True
-                            replan_reason = lines[-1][len("REQUEST_REPLAN:"):].strip()
-                            step_output_data["text_response"] = "\n".join(lines[:-1]).strip() # Remove directive from output
-                            # Also update implementation_results if any command output this as part of its string.
-                            # This is less likely as commands return structured data.
-                            # For now, assume it's primarily in the raw text_response.
+                            replan_requested_this_step = True # Use step-specific flag
+                            replan_reason = lines[-1][len("REQUEST_REPLAN:"):] .strip()
+                            step_output_data["text_response"] = "\n".join(lines[:-1]).strip()
 
                 elif agent_name_from_plan == "CodeCritic":
                     if isinstance(previous_step_output, dict) and "text_response" in previous_step_output:
@@ -1389,21 +1381,18 @@ class EnhancedMultiAgentSystem:
                         yield {"type": "error", "content": "ArtCritic called without valid MainCoder output from previous step."}
                         step_output_data = {"error": "Missing valid input for ArtCritic."}
                 
-                else:
+                else: # Unknown agent
                     yield {"type": "error", "content": f"Unknown agent in plan: {agent_name_from_plan}. Skipping step."}
                     step_output_data = f"Error: Unknown agent {agent_name_from_plan}"
 
-                # --- Re-plan logic ---
-                if replan_requested:
+                # --- Re-plan logic (now checked AFTER agent execution within the try block) ---
+                if replan_requested_this_step:
                     yield {"type": "system", "content": f"🤖 Agent {agent_name_from_plan} requested a re-plan. Reason: {replan_reason}. Initiating new planning cycle..."}
-
-                    # Summarize recent changes for the new planner prompt
                     recent_changes_summary = "No recent changes logged."
                     if hasattr(self, 'project_context') and self.project_context.get("recent_changes"):
-                        changes_to_log = self.project_context["recent_changes"][-5:] # Last 5 changes for context
+                        changes_to_log = self.project_context["recent_changes"][-5:]
                         formatted_changes = [f"- {ch['command']}: {str(ch['args'])[:100]}" for ch in changes_to_log]
-                        if formatted_changes:
-                            recent_changes_summary = "\n".join(formatted_changes)
+                        if formatted_changes: recent_changes_summary = "\n".join(formatted_changes)
 
                     new_planner_prompt = (
                         f"RE-PLANNING REQUESTED. Original User Prompt: '{original_user_prompt}'.\n"
@@ -1411,40 +1400,56 @@ class EnhancedMultiAgentSystem:
                         f"Context of recent system actions that led to this:\n{recent_changes_summary}\n\n"
                         f"Please formulate a new plan to achieve the original user prompt, taking this new context and reason into account. Avoid the previous pitfalls."
                     )
-
                     new_plan_steps = self._get_plan_from_planner(new_planner_prompt)
+
+                    if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]: # Deactivate current agent
+                        yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
+
                     if new_plan_steps:
+                        yield {"type": "system", "content": f"📜 New plan received with {len(new_plan_steps)} steps. Restarting execution..."}
                         plan_steps = new_plan_steps
-                        i = -1 # Reset loop to start from the beginning of the new plan
-                        previous_step_output = None # Reset previous output
-                        yield {"type": "system", "content": f"📜 New plan received with {len(plan_steps)} steps. Restarting execution..."}
-                        if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
-                             yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"} # Current agent inactive
-                        continue # Restart the loop with the new plan
+                        i = 0
+                        previous_step_output = None
+                        completed_normally = False # Reset for new plan
+                        replan_failed_to_get_new_steps = False
+                        continue # Crucial: Jumps to the next iteration of `while i < len(plan_steps)` with i=0
                     else:
                         yield {"type": "error", "content": "Planner failed to generate a new plan after re-plan request. Stopping."}
-                        break # Exit the loop
+                        replan_failed_to_get_new_steps = True
+                        break # Exit while loop
 
+                # Normal step completion (no re-plan requested or re-plan failed to get new steps)
                 if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                     yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
 
                 previous_step_output = step_output_data
 
-                if is_final_step and not replan_requested: # Only consider final if no re-plan is pending
-                    yield {"type": "system", "content": f"✅ Final step ({agent_name_from_plan}) completed."}
+                if is_final_step: # No `and not replan_requested_this_step` needed here as continue/break handles it
+                     yield {"type": "system", "content": f"✅ Final step ({agent_name_from_plan}) completed."}
+                     completed_normally = True # Mark normal completion of the (potentially new) plan
+                     # Loop will terminate naturally if this was the last step
 
             except Exception as e:
-                if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]: # Ensure status is reset on error
+                if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                     yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
                 error_msg = f"Error during step execution ({agent_name_from_plan}): {type(e).__name__} - {str(e)}\nFull Traceback:\n{traceback.format_exc()}"
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": error_msg}
                 previous_step_output = {"error": error_msg}
-                # Optionally, break the loop:
-                # yield {"type": "system", "content": f"Stopping plan execution due to error in step {i+1}."}
-                # break
+                self._log_interaction("run_interaction_error_traceback", traceback.format_exc())
+                break
 
-        yield {"type": "system", "content": "🏁 Planner execution complete."}
+            i += 1 # Increment for next step ONLY if no 'continue' or 'break' was hit
+
+        # Determine the final message based on how the loop exited
+        if completed_normally: # Loop finished all steps of the current plan
+            yield {"type": "system", "content": "🏁 Planner execution complete."}
+        elif replan_failed_to_get_new_steps: # Replan was requested but failed
+            yield {"type": "system", "content": "🏁 Planner execution stopped: Failed to generate a new plan after re-plan request."}
+        elif i < len(plan_steps): # Loop broke prematurely due to an error in a step
+            yield {"type": "system", "content": f"🏁 Planner execution stopped due to an error in step {i+1}."}
+        # else: # Loop might also terminate if plan_steps becomes empty unexpectedly, though less likely with current logic
+            # yield {"type": "system", "content": "🏁 Planner execution concluded."}
 
 
     def _get_code_critique(self, user_prompt, main_response, implementation_results):
