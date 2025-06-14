@@ -20,9 +20,18 @@ from long_term_memory import LongTermMemory # Added
 try:
     from google import genai
     from google.genai import types
+    # Try to import key classes for early validation and use in type hinting if desired
+    from google.genai.types import Tool, FunctionDeclaration, GenerationConfig
     GENAI_IMPORTED = True
 except ImportError:
-    GENAI_IMPORTED = False
+    try:
+        # Fallback for environments where the top-level 'types' might be different
+        from google import genai
+        from google.generativeai import types
+        from google.generativeai.types import Tool, FunctionDeclaration, GenerationConfig
+        GENAI_IMPORTED = True
+    except ImportError:
+        GENAI_IMPORTED = False
 
 class PlanStep:
     def __init__(self, thought: str, command: str):
@@ -221,7 +230,7 @@ The final step in your plan SHOULD be an `end_task()` command if the request imp
 2.  AVAILABLE TOOLS/COMMANDS:
     You can use any of the following tools in your plan. Adhere strictly to their usage as described.
     The paths for file operations should be relative to the project's root (e.g., 'filename.txt' or 'subdir/filename.txt').
-    {tool_list}
+    The available tools are implicitly provided to you via the API. Focus on using them based on their names and descriptions.
 
 3.  USER REQUEST:
     "{user_request}"
@@ -332,46 +341,48 @@ class EnhancedMultiAgentSystem:
         return "✅ Task marked as complete by planner."
 
     def _get_tool_descriptions(self):
-        descriptions = "Available commands:\n"
-        # Sort for consistent order in prompt
+        try:
+            from google.genai.types import Tool, FunctionDeclaration
+        except ImportError:
+            from google.generativeai.types import Tool, FunctionDeclaration
+
+        command_descriptions = {
+            "create_file": "Creates a new text file with specified content.",
+            "write_to_file": "Overwrites an existing text file with new content.",
+            "delete_file": "Deletes a file or directory.",
+            "run_command": "Executes a shell command in the project directory.",
+            "generate_image": "Generates an image using AI based on a text prompt.",
+            "remember": "Stores text content into long-term memory.",
+            "recall": "Retrieves relevant information from long-term memory.",
+            "rename_file": "Renames a file or directory.",
+            "end_task": "Signifies that the current task or sub-task is complete."
+        }
+
+        function_declarations = []
         sorted_cmd_names = sorted(self.command_handlers.keys())
 
         for cmd_name in sorted_cmd_names:
-            # Future: Could fetch detailed descriptions if stored with handlers
-            # For now, just list names and basic placeholders for args
-            if cmd_name == "create_file":
-                desc = "create_file(path: STRING, content: STRING)"
-            elif cmd_name == "write_to_file":
-                desc = "write_to_file(path: STRING, content: STRING)"
-            elif cmd_name == "delete_file":
-                desc = "delete_file(path: STRING)"
-            elif cmd_name == "run_command":
-                desc = "run_command(command: STRING)"
-            elif cmd_name == "generate_image":
-                desc = "generate_image(path: STRING, prompt: STRING)"
-            elif cmd_name == "remember":
-                desc = "remember(text_content: STRING)"
-            elif cmd_name == "recall":
-                desc = "recall(query_text: STRING, max_results: INT = 5)"
-            elif cmd_name == "rename_file":
-                desc = "rename_file(old_path: STRING, new_path: STRING)"
-            elif cmd_name == "end_task":
-                desc = "end_task()"
-            else:
-                desc = f"{cmd_name}(...)" # Generic placeholder
-            descriptions += f"- `{desc}`\n"
+            if cmd_name in command_descriptions:
+                # TODO: Define parameters for each function declaration if the API requires it.
+                # For now, creating FunctionDeclaration without parameters.
+                declaration = FunctionDeclaration(
+                    name=cmd_name,
+                    description=command_descriptions[cmd_name]
+                    # parameters: {} # Add schema if necessary
+                )
+                function_declarations.append(declaration)
+            # else:
+                # Optionally handle commands not in command_descriptions,
+                # e.g., log a warning or create a default description.
 
-        # Ensure end_task is mentioned if planner uses it, even if somehow missed by loop (defensive)
-        # Given the explicit add to command_handlers and sorted loop, this check might be redundant
-        # but doesn't hurt.
-        if "end_task" not in sorted_cmd_names:
-             if not any("end_task()" in line for line in descriptions.splitlines()):
-                 descriptions += "- `end_task()`: Signifies the task is complete.\n"
-        return descriptions.strip()
+        # The Gemini API expects a list of FunctionDeclaration objects directly for the 'tools' parameter in GenerationConfig.
+        # Return the list of FunctionDeclaration objects directly.
+        return function_declarations
 
-    def _call_planner_llm(self, current_user_prompt: str, project_context_str: str, ltm_summary_str: str, tool_descriptions_str: str):
+    def _call_planner_llm(self, current_user_prompt: str, project_context_str: str, ltm_summary_str: str):
         if not self.client:
             err_msg = "Planner Error: LLM client not configured."
+            print(f"DEBUG: planner_client_error: {err_msg}")
             self.error_context.append(err_msg)
             self._log_interaction("planner_client_error", err_msg)
             return None
@@ -382,17 +393,35 @@ class EnhancedMultiAgentSystem:
         formatted_prompt = PLANNER_AGENT_PROMPT.format(
             user_request=current_user_prompt,
             project_context=project_context_str,
-            ltm_summary=ltm_summary_str,
-            tool_list=tool_descriptions_str
+            ltm_summary=ltm_summary_str
+            # tool_list is no longer passed in the prompt directly
         )
 
         self._log_interaction("planner_prompt", formatted_prompt)
+        print(f"DEBUG: planner_formatted_prompt_sent:\n{formatted_prompt}")
 
         try:
-            response = self.client.models.generate_content(
-                model=TEXT_MODEL_NAME,
-                contents=[formatted_prompt]
-            )
+            # Get the list of FunctionDeclaration objects
+            function_declarations = self._get_tool_descriptions()
+
+            # Ensure GenerationConfig is imported (it should be available from top-level imports)
+            # from google.genai.types import GenerationConfig # Or generativeai.types
+
+            gen_config = None
+            if function_declarations:
+                # Assuming GenerationConfig can take list[FunctionDeclaration] directly for its tools parameter.
+                # This is based on the subtask's clarification that the *content* of
+                # GenerationConfig(tools=...) should be list[FunctionDeclaration].
+                gen_config = GenerationConfig(tools=function_declarations)
+
+            kwargs = {
+                'model': TEXT_MODEL_NAME,
+                'contents': [formatted_prompt]
+            }
+            if gen_config: # Only add generation_config if it was created
+                kwargs['generation_config'] = gen_config
+
+            response = self.client.models.generate_content(**kwargs)
             raw_response_text = ""
             if hasattr(response, 'parts') and response.parts:
                 for part in response.parts:
@@ -402,11 +431,13 @@ class EnhancedMultiAgentSystem:
                 raw_response_text = response.text
             else:
                 err_msg = "Planner Error: LLM response structure not as expected (missing 'parts' or 'text')."
+                print(f"DEBUG: planner_llm_response_format_error: {err_msg} Response: {str(response)[:200]}")
                 self.error_context.append(err_msg)
                 self._log_interaction("planner_llm_response_format_error", f"{err_msg} Response: {str(response)[:200]}")
                 return None
 
             self._log_interaction("planner_raw_response", raw_response_text)
+            print(f"DEBUG: planner_raw_llm_response_received:\n{raw_response_text}")
 
             json_str = raw_response_text
             json_match = re.search(r"```json\s*(\{.*?\})\s*```", raw_response_text, re.DOTALL | re.IGNORECASE)
@@ -419,6 +450,7 @@ class EnhancedMultiAgentSystem:
                     json_str = raw_response_text[first_brace:last_brace+1]
                 else:
                     warn_msg = f"Planner Warning: No clear JSON block or structure found in response. Will attempt to parse raw text. Snippet: {raw_response_text[:200]}"
+                    print(f"DEBUG: planner_json_extraction_warning: {warn_msg}")
                     self.error_context.append(warn_msg)
                     self._log_interaction("planner_json_extraction_warning", warn_msg)
 
@@ -432,6 +464,7 @@ class EnhancedMultiAgentSystem:
                             plan_objects.append(PlanStep(thought=str(step_data["thought"]), command=str(step_data["command"])))
                         else:
                             err_msg = f"Planner Error: Invalid step data format in plan at index {i}. Step data (snippet): {str(step_data)[:200]}"
+                            print(f"DEBUG: planner_plan_step_format_error: {err_msg}")
                             self.error_context.append(err_msg)
                             self._log_interaction("planner_plan_step_format_error", err_msg)
                             # Continue processing other steps, effectively skipping this invalid one.
@@ -439,18 +472,23 @@ class EnhancedMultiAgentSystem:
                     self._log_interaction("planner_parsed_plan", [repr(p) for p in plan_objects])
                     return plan_objects # Return potentially partial plan if some steps were invalid
                 else:
+                    print(f"DEBUG: planner_json_structure_error_received_json: Parsed JSON with unexpected structure:\n{str(parsed_json)[:500]}...")
                     err_msg = f"Planner Error: JSON response is not in the expected structure (e.g., missing 'plan' list or not a dict). Parsed JSON (snippet): {str(parsed_json)[:300]}"
+                    print(f"DEBUG: planner_json_structure_error: {err_msg}. Raw response (snippet): {raw_response_text[:200]}")
                     self.error_context.append(err_msg)
                     self._log_interaction("planner_json_structure_error", f"{err_msg}. Raw response (snippet): {raw_response_text[:200]}")
                     return None
             except json.JSONDecodeError as e:
+                print(f"DEBUG: planner_json_decode_error_problematic_string: String that failed to parse:\n{json_str[:500]}...")
                 err_msg = f"Planner Error: Failed to decode JSON response. Error: {e}. JSON string attempted (snippet): {json_str[:300]}"
+                print(f"DEBUG: planner_json_decode_error: {err_msg}. Raw response (snippet): {raw_response_text[:200]}")
                 self.error_context.append(err_msg)
                 self._log_interaction("planner_json_decode_error", f"{err_msg}. Raw response (snippet): {raw_response_text[:200]}")
                 return None
 
         except Exception as e:
             error_message = f"Planner Error: LLM API call or initial response processing failed. Type: {type(e).__name__}, Error: {e}"
+            print(f"DEBUG: planner_llm_api_call_error: {error_message}")
             self.error_context.append(error_message)
             self._log_interaction("planner_llm_api_call_error", error_message)
             return None
@@ -570,14 +608,28 @@ class EnhancedMultiAgentSystem:
             for mem in relevant_ltm_entries:
                 ltm_summary_str += f"- \"{mem.content}\" (Stored: {mem.timestamp})\n"
 
-        tool_descriptions_str = self._get_tool_descriptions()
+        # tool_descriptions_str is no longer passed to _call_planner_llm
+        # tools_list = self._get_tool_descriptions() # This is now called inside _call_planner_llm
+
+        print(f"DEBUG: planner_input_user_prompt:\n{enhanced_user_prompt}")
+        print(f"DEBUG: planner_input_project_context:\n{project_context_str}")
+        print(f"DEBUG: planner_input_ltm_summary:\n{ltm_summary_str}")
 
         plan_steps = self._call_planner_llm(
             enhanced_user_prompt, # Pass the possibly enhanced prompt to the planner
             project_context_str,
-            ltm_summary_str,
-            tool_descriptions_str
+            ltm_summary_str
+            # tool_descriptions_str argument removed
         )
+
+        if plan_steps is not None:
+            if plan_steps: # If the list is not empty
+                plan_summary_for_log = [(step.thought, step.command) for step in plan_steps]
+                print(f"DEBUG: planner_output_plan_steps: Plan generated:\n{str(plan_summary_for_log)}")
+            else: # If the list is empty
+                print("DEBUG: planner_output_plan_steps: Planner returned an empty plan.")
+        else: # If plan_steps is None
+            print("DEBUG: planner_output_plan_steps: Planner failed to return a plan (plan_steps is None).")
 
         current_main_coder_prompt = enhanced_user_prompt # Default if no plan or prepending
 
