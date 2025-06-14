@@ -2618,12 +2618,14 @@ class EnhancedGeminiIDE(tk.Tk):
     def _on_editor_key_release(self, event=None):
         """Enhanced editor key release handler"""
         self._apply_optimized_syntax_highlighting()
-        if hasattr(self, '_save_timer'):
+        if self._save_timer:
             self.after_cancel(self._save_timer)
+            self._save_timer = None
         self._save_timer = self.after(2000, self._auto_save)
 
     def _auto_save(self):
         """Auto-save current file if one is open."""
+        self._save_timer = None
         if self.current_open_file_path:
             self.save_current_file()
 
@@ -3411,8 +3413,27 @@ class EnhancedGeminiIDE(tk.Tk):
                     changed_file_path = Path(msg["content"])
                     if changed_file_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
                         self.display_enhanced_image(changed_file_path)
-                    elif self.current_open_file_path and self.current_open_file_path.samefile(changed_file_path):
-                        self.display_file(self.current_open_file_path)
+                    else:
+                        # Check if the file that triggered the event still exists
+                        if not changed_file_path.exists():
+                            # If the changed file doesn't exist, it might have been deleted.
+                            # If this deleted file was the one open in the editor, clear the editor.
+                            if self.current_open_file_path and self.current_open_file_path == changed_file_path:
+                                self.editor.delete("1.0", tk.END)
+                                self.current_open_file_path = None
+                                self.status_var.set(f"ℹ️ File closed: {changed_file_path.name} was deleted.")
+                            # Skip further processing for this non-existent file
+                            continue
+
+                        # Check if the currently open file in the editor still exists
+                        if self.current_open_file_path and not self.current_open_file_path.exists():
+                            self.editor.delete("1.0", tk.END)
+                            self.status_var.set(f"ℹ️ File closed: {self.current_open_file_path.name} was moved or deleted.")
+                            self.current_open_file_path = None
+                            # No 'continue' here, as changed_file_path might be different and still needs processing below
+
+                        if self.current_open_file_path and self.current_open_file_path.samefile(changed_file_path):
+                            self.display_file(self.current_open_file_path)
                 elif msg["type"] == "done":
                     self.input_txt.config(state="normal")
                     self.send_btn.config(state="normal")
@@ -3435,7 +3456,7 @@ class EnhancedGeminiIDE(tk.Tk):
             if self._debounce_insights_id:
                 self.after_cancel(self._debounce_insights_id)
                 self._debounce_insights_id = None
-            if hasattr(self, '_save_timer') and self._save_timer:
+            if self._save_timer:
                 self.after_cancel(self._save_timer)
                 self._save_timer = None
             self.destroy()
