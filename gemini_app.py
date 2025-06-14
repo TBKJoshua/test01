@@ -9,6 +9,7 @@ from datetime import datetime
 import re
 import shutil
 import json
+import traceback
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, scrolledtext
 from pathlib import Path
@@ -921,20 +922,43 @@ class EnhancedMultiAgentSystem:
 
         implementation_results = []
         generated_image_paths = []
-        for result in self._process_enhanced_commands(accumulated_main_response_text):
-            implementation_results.append(result)
-            yield result
-            if result.get("type") == "file_changed":
-                file_path_str = result.get("content", "")
-                if file_path_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
-                    safe_file_path = self._safe_path(Path(file_path_str).name)
-                    if safe_file_path and Path(file_path_str).parent.name == VM_DIR.name or \
-                       (Path(file_path_str).parent.parent.name == VM_DIR.name if Path(file_path_str).parent.name else False):
-                        generated_image_paths.append(str(Path(VM_DIR) / Path(file_path_str).relative_to(VM_DIR)))
+        for cmd_proc_result in self._process_enhanced_commands(accumulated_main_response_text):
+            implementation_results.append(cmd_proc_result) # Always append to internal list
+
+            if isinstance(cmd_proc_result, dict): # Only yield dictionaries to UI
+                yield cmd_proc_result
+                # Check for file_changed type within the dict for image paths
+                if cmd_proc_result.get("type") == "file_changed":
+                    file_path_str = cmd_proc_result.get("content", "")
+                    if file_path_str.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                        # Assuming safe_path and VM_DIR are accessible or path is already project-relative
+                        # This logic might need refinement based on how paths are handled in file_changed
+                        # For now, directly use file_path_str if it's supposed to be relative to VM_DIR
+                        # Example: if file_path_str is 'image.png' and VM_DIR is 'vm', it becomes 'vm/image.png'
+                        # The path added to generated_image_paths should be relative to the project root or consistently handled.
+                        # Let's assume file_path_str from "file_changed" is already a path relative to VM_DIR or absolute.
+                        # For consistency, let's ensure it's relative to VM_DIR for generated_image_paths list.
+
+                        # This path reconstruction needs to be robust.
+                        # If content is 'vm/image.png', then Path(file_path_str).relative_to(VM_DIR) is 'image.png'
+                        # Path(VM_DIR) / 'image.png' is correct.
+                        # If content is 'image.png' (already relative to VM_DIR), then Path(VM_DIR) / file_path_str
+
+                        # Safest: assume 'content' is path relative to VM_DIR or absolute that can be made relative
+                        img_p = Path(file_path_str)
+                        if not img_p.is_absolute(): # If it's not absolute, assume it's relative to VM_DIR
+                            img_p = VM_DIR / img_p
+
+                        # Check if it's within VM_DIR before making relative, to handle potential absolute paths outside
+                        if str(img_p.resolve()).startswith(str(VM_DIR.resolve())):
+                             rel_img_path = img_p.relative_to(VM_DIR.resolve())
+                             generated_image_paths.append(str(rel_img_path))
+
+            # Raw strings (like "REQUEST_REPLAN:...") are in implementation_results but not yielded here.
 
         return {
             "text_response": accumulated_main_response_text,
-            "implementation_results": implementation_results,
+            "implementation_results": implementation_results, # Contains all results, including raw strings
             "generated_image_paths": generated_image_paths
         }
 
@@ -1266,7 +1290,9 @@ class EnhancedMultiAgentSystem:
         # Loop control variables for final message
         completed_normally = False
         replan_failed_to_get_new_steps = False
+        # original_prompt_for_continuous_loop = enhanced_user_prompt # Removed: No longer needed for continuous loop
 
+        # This is the main plan execution loop, no longer an outer "while True"
         while i < len(plan_steps):
             step = plan_steps[i]
             agent_name_from_plan = step.get('agent_name')
@@ -1348,18 +1374,47 @@ class EnhancedMultiAgentSystem:
                             current_instruction_for_coder = current_instruction_for_coder.replace("{ART_CRITIC_FEEDBACK_PLACEHOLDER}", critique_text_to_inject.strip())
                             yield {"type": "system", "content": "📝 Injected ArtCritic feedback into MainCoder instruction for refinement."}
 
-                    main_coder_output_dict = yield from self._execute_main_coder_phase(
+                    # Manually drive _execute_main_coder_phase to capture its return value
+                    # while still yielding its UI messages.
+                    main_coder_phase_generator = self._execute_main_coder_phase(
                         coder_instruction=current_instruction_for_coder,
                         art_guidance=art_guidance_for_coder
                     )
-                    step_output_data = main_coder_output_dict
+                    returned_main_coder_data = None
+                    try:
+                        while True:
+                            ui_message = next(main_coder_phase_generator) # Get yielded UI messages
+                            yield ui_message # Pass them up to the UI processing loop
+                    except StopIteration as e:
+                        returned_main_coder_data = e.value # This is the dict {text_response, implementation_results, ...}
 
-                    if isinstance(step_output_data, dict) and "text_response" in step_output_data:
+                    if returned_main_coder_data is None:
+                        self.error_context.append("MainCoder phase failed to return data (returned None).")
+                        step_output_data = {"error": "MainCoder phase failed to return data.", "implementation_results": [], "text_response": "", "generated_image_paths": []}
+                    else:
+                        step_output_data = returned_main_coder_data
+
+
+                    # Check for REQUEST_REPLAN from command execution first (now using step_output_data)
+                    if isinstance(step_output_data, dict) and step_output_data.get("implementation_results"):
+                        for item_result in step_output_data.get("implementation_results", []):
+                            if isinstance(item_result, str) and item_result.startswith("REQUEST_REPLAN:"):
+                                replan_requested_this_step = True
+                                replan_reason = item_result[len("REQUEST_REPLAN:"):].strip()
+                                yield {"type": "system", "content": f"ℹ️ Replan triggered by failed command. Reason: {replan_reason[:100]}..."}
+                                # Clean up text_response if the same signal is there to avoid duplicate processing by planner
+                                if "text_response" in step_output_data and step_output_data["text_response"].endswith(item_result):
+                                    step_output_data["text_response"] = step_output_data["text_response"][:-len(item_result)].strip()
+                                break
+
+                    # Then, check for REQUEST_REPLAN from MainCoder's textual output (if not already caught)
+                    if not replan_requested_this_step and isinstance(step_output_data, dict) and "text_response" in step_output_data:
                         response_text = step_output_data["text_response"]
                         lines = response_text.strip().splitlines()
                         if lines and lines[-1].startswith("REQUEST_REPLAN:"):
-                            replan_requested_this_step = True # Use step-specific flag
+                            replan_requested_this_step = True
                             replan_reason = lines[-1][len("REQUEST_REPLAN:"):] .strip()
+                            # No need to yield here as the generic replan message will cover it later if this is the primary source
                             step_output_data["text_response"] = "\n".join(lines[:-1]).strip()
 
                 elif agent_name_from_plan == "CodeCritic":
@@ -1442,14 +1497,15 @@ class EnhancedMultiAgentSystem:
             i += 1 # Increment for next step ONLY if no 'continue' or 'break' was hit
 
         # Determine the final message based on how the loop exited
-        if completed_normally: # Loop finished all steps of the current plan
-            yield {"type": "system", "content": "🏁 Planner execution complete."}
-        elif replan_failed_to_get_new_steps: # Replan was requested but failed
+        # This section is reached after the `while i < len(plan_steps)` loop naturally finishes or is broken out of.
+        if completed_normally: # Loop finished all steps of the current plan (could be an initial or a re-plan)
+            yield {"type": "system", "content": "🏁 Planner execution complete for the current request."}
+        elif replan_failed_to_get_new_steps: # Replan was requested but failed to get new steps
             yield {"type": "system", "content": "🏁 Planner execution stopped: Failed to generate a new plan after re-plan request."}
         elif i < len(plan_steps): # Loop broke prematurely due to an error in a step
             yield {"type": "system", "content": f"🏁 Planner execution stopped due to an error in step {i+1}."}
-        # else: # Loop might also terminate if plan_steps becomes empty unexpectedly, though less likely with current logic
-            # yield {"type": "system", "content": "🏁 Planner execution concluded."}
+        else: # This case implies plan_steps might have been empty or loop finished without setting completed_normally (e.g. error during final step processing)
+            yield {"type": "system", "content": "🏁 Planner execution concluded for the current request."}
 
 
     def _get_code_critique(self, user_prompt, main_response, implementation_results):
@@ -1927,12 +1983,32 @@ Focus on actionable improvements that leverage all three agent perspectives.
                         break
                 else:
                     result = self.command_handlers[func_name](*args)
-                    if func_name == "generate_image":
-                        for update in result:
+
+                    if func_name == "run_command":
+                        if isinstance(result, dict) and result.get("status") == "REPLAN_REQUESTED":
+                            reason = result.get("reason", "Unknown reason for re-plan from run_command.")
+                            replan_signal = f"REQUEST_REPLAN: {reason}"
+                            # Yield the raw replan signal string directly.
+                            # This is intended to be caught by run_enhanced_interaction.
+                            yield replan_signal
+                                                        # The expectation is that run_enhanced_interaction's main loop,
+                                                        # specifically where it iterates through the results of _execute_main_coder_phase
+                                                        # (which in turn iterates through _process_enhanced_commands),
+                                                        # will now see this raw string and needs to be adapted to recognize it
+                                                        # as a replan signal, similar to how it checks the MainCoder's text_response.
+                                                        # This part of the integration is outside the scope of this specific subtask for _process_enhanced_commands,
+                                                        # but it's important for the overall functionality.
+                            continue # Continue to the next command in response_text without yielding other typical messages for this command
+                        else: # Successful run_command (result is a string)
+                            yield {"type": "system", "content": result}
+                            # No "file_changed" for run_command unless it explicitly modifies a known file and reports it.
+                    elif func_name == "generate_image":
+                        for update in result: # generate_image yields its own dicts
                             yield update
-                    else:
-                        yield {"type": "system", "content": result}
-                        if "✅" in result:
+                            # file_changed is yielded by generate_image itself
+                    else: # For other commands (create_file, write_to_file, delete_file, etc.)
+                        yield {"type": "system", "content": result} # This is the "✅ Created file: ..." or "❌ Error..." message
+                        if isinstance(result, str) and "✅" in result: # Check if it's a success string
                             if func_name == "create_file" and args:
                                 yield {"type": "file_changed", "content": args[0]}
                             elif func_name == "write_to_file" and args:
@@ -1941,9 +2017,13 @@ Focus on actionable improvements that leverage all three agent perspectives.
                                 yield {"type": "file_changed", "content": args[0]}
                             elif func_name == "rename_file" and len(args) > 1:
                                 yield {"type": "file_changed", "content": args[1]}
+
+                    # Common logic for file changing operations (excluding run_command here as its file changes are implicit)
                     if func_name in ["create_file", "write_to_file", "generate_image", "delete_file", "rename_file"]:
-                        if "recent_changes" not in self.project_context:
-                            self.project_context["recent_changes"] = []
+                        # Ensure result is a string and indicates success before logging change for file operations
+                        if isinstance(result, str) and "✅" in result:
+                            if "recent_changes" not in self.project_context:
+                                self.project_context["recent_changes"] = []
                         self.project_context["recent_changes"].append({
                             "command": func_name,
                             "args": args,
@@ -2148,18 +2228,28 @@ Focus on actionable improvements that leverage all three agent perspectives.
                 output += f"📤 STDOUT:\n{proc.stdout}\n"
             if proc.stderr:
                 output += f"⚠️ STDERR:\n{proc.stderr}\n"
-                self.error_context.append(f"Command stderr: {proc.stderr}")
+                self.error_context.append(f"Command stderr for '{command}': {proc.stderr}") # Added command context
+
             if proc.returncode == 0:
                 output += "✅ Command completed successfully"
+                return output
             else:
-                output += f"❌ Command failed with exit code: {proc.returncode}"
-            return output
+                # output += f"❌ Command failed with exit code: {proc.returncode}" # Original line
+                error_reason = f"The command '{command}' failed with exit code {proc.returncode}. Stderr: {proc.stderr}"
+                self.error_context.append(f"Command failed: {error_reason}") # Still update error_context
+                return {
+                    "status": "REPLAN_REQUESTED",
+                    "reason": error_reason
+                }
         except subprocess.TimeoutExpired:
-            error_msg = "⏰ Command timed out after 120 seconds"
-            self.error_context.append(error_msg)
-            return error_msg
-        except Exception as e:
-            error_msg = f"❌ Command execution error: {e}"
+            error_reason = f"The command '{command}' timed out after 120 seconds."
+            self.error_context.append(error_reason) # Still update error_context
+            return {
+                "status": "REPLAN_REQUESTED",
+                "reason": error_reason
+            }
+        except Exception as e: # For other exceptions, return the string error message as before
+            error_msg = f"❌ Command execution error for '{command}': {e}"
             self.error_context.append(error_msg)
             return error_msg
 
