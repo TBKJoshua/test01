@@ -359,6 +359,34 @@ Your task in a re-planning scenario is to deeply analyze this feedback and the o
     ]
     ```
 
+*   **Error Handling/Fixing Strategy:**
+    *   When the user requests to "fix errors" or if your input context (specifically `RECENT ERRORS (LOG):`) shows recent, actionable errors:
+        *   **Priority 1 (Actionable Errors for MainCoder)**: If the errors are specific and seem fixable by `MainCoder` (e.g., a `write_to_file` formatting error, a simple Python syntax error in code `MainCoder` recently generated), plan a step for `MainCoder`.
+            *   The instruction should be precise: Refer to the specific error from the log, the file involved (e.g., 'script.py'), and the type of error (e.g., 'unterminated string literal during write_to_file').
+            *   Direct `MainCoder` to re-attempt the operation, explicitly reminding it to use its updated knowledge (e.g., correct `write_to_file` content formatting rules: single string literal, `\\n` for newlines, escaped quotes).
+            *   Example for `MainCoder` to fix a `write_to_file` error:
+              ```json
+              [
+                {
+                  "agent_name": "MainCoder",
+                  "instruction": "The system log indicates a recent 'unterminated string literal' error occurred when `write_to_file` was called for the file 'script.py'. This often happens due to incorrect formatting of multi-line content. Please re-attempt the `write_to_file` operation for 'script.py', ensuring the entire file content is prepared as a single, valid Python string literal with all newlines escaped as `\\\\n` and internal quotes properly escaped (e.g., `\\'` or `\\\\\"`). You may need to refer to the previous content intended for 'script.py' (if available from logs or your working context) and apply the correct formatting rules before executing the command.",
+                  "is_final_step": true
+                }
+              ]
+              ```
+        *   **Priority 2 (Vague Errors or Clarification Needed)**: If the user's request to "fix errors" is vague (e.g., "my game is broken") and no specific, actionable errors are in the `RECENT ERRORS (LOG):`, OR if the logged errors are complex/conceptual and not directly fixable by `MainCoder` commands, route to `PersonaAgent` to ask the user for more details.
+            *   Example for `PersonaAgent` to clarify:
+              ```json
+              [
+                {
+                  "agent_name": "PersonaAgent",
+                  "instruction": "User asked to 'fix the errors', but no specific, actionable errors are currently logged in the system overview, or the existing errors require more clarification. Could you please provide more details about the errors you are referring to? For example, which file is affected, what is the exact error message, or what specific behavior is incorrect?",
+                  "is_final_step": true
+                }
+              ]
+              ```
+    *   Always consult your `RECENT ERRORS (LOG):` context when deciding on this strategy.
+
 *   **Chained MainCoder Calls:** You can chain multiple `MainCoder` calls if needed (e.g., generate code, then generate an image based on that code, then create a file to store some results).
 
 **CRITICAL RULES:**
