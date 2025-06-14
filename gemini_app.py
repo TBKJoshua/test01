@@ -69,7 +69,7 @@ You operate in a headless environment with full vision capabilities. The current
 - `delete_file(path)`: Deletes a file or directory.
 - `rename_file(old_path, new_path)`: Renames a file or directory.
 - `run_command(command)`: Executes a shell command in the project directory.
-- `generate_image(path, prompt)`: Generates an image using AI based on a text prompt.
+- `generate_image(path, prompt)`: Generates an image using AI based on a text prompt. The `path` argument must be a filename (e.g., 'my_image.png') relative to the project's `vm/` directory. Do NOT include 'vm/' in the `path` string itself; the system handles this automatically. For example, use `generate_image('cat_v1.png', 'A cat')`, NOT `generate_image('vm/cat_v1.png', 'A cat')`.
 - `set_user_preference(key, value)`: Stores a user preference. Both key and value must be strings. Use this to remember user choices for future interactions (e.g., preferred art style, default project settings).
 - `get_user_preference(key)`: Retrieves a previously stored user preference. Returns the value or a 'not found' message.
 
@@ -94,7 +94,7 @@ You operate in a headless environment with full vision capabilities. The current
 5. **VISUAL AWARENESS**: Consider existing images when making implementation decisions.
 6. **COLLABORATION**: Work with Code Critic and Art Critic for optimal results.
 7. **QUALITY EXCELLENCE**: Aim for high-quality implementation as critique agents will grade your work.
-8. **IMAGE GENERATION VARIATIONS**: When tasked with generating an image, you MUST generate three distinct variations. For each variation, issue a separate `generate_image(path, prompt)` command. Use unique, descriptive filenames (e.g., `image_v1.png`, `image_v2.png`, `image_v3.png`). If possible, subtly vary the prompts for each of the three images to encourage diversity, while adhering to the core user request and any artistic guidance provided.
+8. **IMAGE GENERATION VARIATIONS**: When tasked with generating an image, you MUST generate three distinct variations. For each variation, issue a separate `generate_image(path, prompt)` command. Use unique, descriptive filenames for the `path` argument (e.g., 'image_v1.png', 'image_v2.png', 'image_v3.png'), ensuring these paths do NOT start with 'vm/'.
 9. **USE RENAME_FILE**: Always use the `rename_file(old_path, new_path)` command for renaming files or directories. Do not use `run_command` with `mv` or `ren` for renaming.
 10. **PREFER SINGLE QUOTES FOR COMMAND ARGUMENTS**: While double quotes are acceptable if handled correctly, for consistency, prefer using single quotes for the string arguments of commands, e.g., `write_to_file('my_file.txt', 'File content with a single quote here: \' needs escaping.')`.
 11. **REQUESTING A RE-PLAN (USE EXTREMELY RARELY):**
@@ -1098,25 +1098,40 @@ class EnhancedMultiAgentSystem:
                         # Assuming safe_path and VM_DIR are accessible or path is already project-relative
                         # This logic might need refinement based on how paths are handled in file_changed
                         # For now, directly use file_path_str if it's supposed to be relative to VM_DIR
-                        # Example: if file_path_str is 'image.png' and VM_DIR is 'vm', it becomes 'vm/image.png'
-                        # The path added to generated_image_paths should be relative to the project root or consistently handled.
-                        # Let's assume file_path_str from "file_changed" is already a path relative to VM_DIR or absolute.
-                        # For consistency, let's ensure it's relative to VM_DIR for generated_image_paths list.
+                        # file_path_str from generate_image's 'file_changed' event is already 'vm/actual_filename.png'
+                        # We need to resolve it to an absolute path to safely make it relative to VM_DIR.resolve()
 
-                        # This path reconstruction needs to be robust.
-                        # If content is 'vm/image.png', then Path(file_path_str).relative_to(VM_DIR) is 'image.png'
-                        # Path(VM_DIR) / 'image.png' is correct.
-                        # If content is 'image.png' (already relative to VM_DIR), then Path(VM_DIR) / file_path_str
+                        img_path_obj = Path(file_path_str) # e.g., Path('vm/tiger.png')
 
-                        # Safest: assume 'content' is path relative to VM_DIR or absolute that can be made relative
-                        img_p = Path(file_path_str)
-                        if not img_p.is_absolute(): # If it's not absolute, assume it's relative to VM_DIR
-                            img_p = VM_DIR / img_p
+                        # Ensure it's resolved from the current working directory if it's relative at this point.
+                        # VM_DIR is also relative (e.g. Path('vm')), so compare apples to apples.
+                        # Path.cwd() / img_path_obj gives absolute path.
+                        # VM_DIR.resolve() gives absolute path to vm directory.
 
-                        # Check if it's within VM_DIR before making relative, to handle potential absolute paths outside
-                        if str(img_p.resolve()).startswith(str(VM_DIR.resolve())):
-                             rel_img_path = img_p.relative_to(VM_DIR.resolve())
-                             generated_image_paths.append(str(rel_img_path))
+                        img_p_absolute = img_path_obj.resolve() # Resolves based on CWD. If file_path_str is 'vm/img.png', this is CWD/vm/img.png
+                        vm_dir_resolved = VM_DIR.resolve()    # Absolute path to vm directory
+
+                        try:
+                            # Check if the image's absolute path is truly within the resolved VM directory
+                            if str(img_p_absolute).startswith(str(vm_dir_resolved) + os.sep):
+                                rel_img_path = img_p_absolute.relative_to(vm_dir_resolved)
+                                generated_image_paths.append(str(rel_img_path))
+                            else:
+                                # This case should ideally not be hit if _safe_path and generate_image work correctly.
+                                # Logging it can help debug if it ever occurs.
+                                # self.error_context.append(f"Debug: Image path {img_p_absolute} not in VM_DIR {vm_dir_resolved} as expected.")
+                                # Fallback: if file_path_str itself is already the relative path we want (e.g. "image.png")
+                                # and somehow the absolute path logic didn't align. This is unlikely.
+                                # For safety, try to use file_path_str's name part if it's simple.
+                                if not Path(file_path_str).is_absolute() and not Path(file_path_str).parent.name == VM_DIR.name:
+                                     # if file_path_str is just "image.png", this might be a fallback
+                                     # but this indicates a deeper inconsistency.
+                                     # Let's stick to the strict check for now.
+                                     pass
+                        except ValueError:
+                            # This can happen if relative_to fails, indicating paths are not related as expected.
+                            # self.error_context.append(f"Debug: ValueError making {img_p_absolute} relative to {vm_dir_resolved}.")
+                            pass
 
             # Raw strings (like "REQUEST_REPLAN:...") are in implementation_results but not yielded here.
 
@@ -2142,95 +2157,110 @@ Focus on actionable improvements that leverage all three agent perspectives.
                 if not isinstance(call_node, ast.Call):
                     self.error_context.append(f"Command parsing error: Not a function call - '{command_str}'")
                     yield {"type": "error", "content": f"❌ Command error: Not a function call - `{command_str}`"}
+                    continue # Skip to next command
+
+                # Ensure func is an ast.Name, not ast.Attribute for direct calls like func()
+                # If it's ast.Attribute (e.g. obj.method()), this simple .id won't work.
+                # However, agent commands are expected to be direct function names.
+                if not isinstance(call_node.func, ast.Name):
+                    self.error_context.append(f"Command parsing error: Not a direct function name - '{command_str}'")
+                    yield {"type": "error", "content": f"❌ Command error: Not a direct function name - `{command_str}`"}
                     continue
+
                 func_name = call_node.func.id
                 if func_name not in self.command_handlers:
                     self.error_context.append(f"Unknown command: '{func_name}' in '{command_str}'")
                     yield {"type": "error", "content": f"❌ Unknown command: `{func_name}`"}
                     continue
+
                 args = []
+                valid_args = True
                 for arg_node in call_node.args:
                     try:
                         args.append(ast.literal_eval(arg_node))
                     except ValueError as ve:
-                        error_msg = f"Command argument error: Non-literal argument in '{command_str}'. Argument: {ast.dump(arg_node)}. Error: {ve}"
+                        error_msg = f"Command argument error: Non-literal argument in '{command_str}'. Argument: {ast.dump(arg_node) if isinstance(arg_node, ast.AST) else str(arg_node)}. Error: {ve}"
                         self._log_to_memory("ERROR", error_msg, priority=1)
                         self.error_context.append(error_msg)
                         yield {"type": "error", "content": f"❌ Command error: Invalid argument in `{command_str}`"}
+                        valid_args = False
                         break
-                else:
-                    result = self.command_handlers[func_name](*args)
 
-                    if func_name == "run_command":
-                        if isinstance(result, dict) and result.get("status") == "REPLAN_REQUESTED":
-                            reason = result.get("reason", "Unknown reason for re-plan from run_command.")
-                            replan_signal = f"REQUEST_REPLAN: {reason}"
-                            # Yield the raw replan signal string directly.
-                            # This is intended to be caught by run_enhanced_interaction.
-                            yield replan_signal
-                                                        # The expectation is that run_enhanced_interaction's main loop,
-                                                        # specifically where it iterates through the results of _execute_main_coder_phase
-                                                        # (which in turn iterates through _process_enhanced_commands),
-                                                        # will now see this raw string and needs to be adapted to recognize it
-                                                        # as a replan signal, similar to how it checks the MainCoder's text_response.
-                                                        # This part of the integration is outside the scope of this specific subtask for _process_enhanced_commands,
-                                                        # but it's important for the overall functionality.
-                            continue # Continue to the next command in response_text without yielding other typical messages for this command
-                        else: # Successful run_command (result is a string)
-                            self._log_to_memory("COMMAND_SUCCESS", f"Successfully ran: {args[0][:100]}", priority=5)
-                            yield {"type": "system", "content": result}
-                            # No "file_changed" for run_command unless it explicitly modifies a known file and reports it.
-                    elif func_name == "generate_image":
-                        image_path_for_log = args[0] if args else "unknown_path"
-                        prompt_for_log = args[1][:50] if len(args) > 1 else "unknown_prompt"
-                        self._log_to_memory("IMAGE_GENERATION", f"Generate image requested for path: {image_path_for_log} with prompt: {prompt_for_log}...", priority=4)
-                        for update in result: # generate_image yields its own dicts
-                            yield update
-                            # file_changed is yielded by generate_image itself
-                    else: # For other commands (create_file, write_to_file, delete_file, etc.)
-                        yield {"type": "system", "content": result} # This is the "✅ Created file: ..." or "❌ Error..." message
-                        if isinstance(result, str) and "✅" in result: # Check if it's a success string
-                            if func_name == "create_file" and args:
-                                self._log_to_memory("FILE_CHANGE", f"Created file: {args[0]}", priority=4)
-                                yield {"type": "file_changed", "content": args[0]}
-                            elif func_name == "write_to_file" and args:
-                                self._log_to_memory("FILE_CHANGE", f"Updated file: {args[0]}", priority=4)
-                                yield {"type": "file_changed", "content": args[0]}
-                            elif func_name == "delete_file" and args:
-                                self._log_to_memory("FILE_CHANGE", f"Deleted: {args[0]}", priority=4)
-                                yield {"type": "file_changed", "content": args[0]}
-                            elif func_name == "rename_file" and len(args) > 1:
-                                self._log_to_memory("FILE_CHANGE", f"Renamed: {args[0]} to {args[1]}", priority=4)
-                                yield {"type": "file_changed", "content": args[1]}
+                if not valid_args:
+                    continue # Skip this command due to arg parsing error
 
-                    # Common logic for file changing operations (excluding run_command here as its file changes are implicit)
-                    if func_name in ["create_file", "write_to_file", "generate_image", "delete_file", "rename_file"]:
-                        # Ensure result is a string and indicates success before logging change for file operations
-                        if isinstance(result, str) and "✅" in result:
+                # At this point, func_name and args are successfully parsed.
+
+                if func_name == "generate_image":
+                    image_gen_results_generator = self.command_handlers[func_name](*args)
+                    for update_message in image_gen_results_generator:
+                        yield update_message
+                        if update_message.get("type") == "file_changed": # Image successfully generated and file path available
                             if "recent_changes" not in self.project_context:
                                 self.project_context["recent_changes"] = []
-                        self.project_context["recent_changes"].append({
-                            "command": func_name,
-                            "args": args,
-                            "timestamp": time.time()
-                        })
-                        self.project_context["recent_changes"] = self.project_context["recent_changes"][-20:]
-                        self.project_files_changed = True
-                    continue
-                if args and isinstance(args[-1], Exception):
-                     continue
+                            self.project_context["recent_changes"].append({
+                                "command": func_name,
+                                "args": args, # (path, prompt)
+                                "timestamp": time.time()
+                            })
+                            self.project_context["recent_changes"] = self.project_context["recent_changes"][-20:]
+                            self.project_files_changed = True # Mark cache dirty
+
+                elif func_name == "run_command":
+                    run_command_output = self.command_handlers[func_name](*args)
+                    if isinstance(run_command_output, dict) and run_command_output.get("status") == "REPLAN_REQUESTED":
+                        yield f"REQUEST_REPLAN: {run_command_output.get('reason', 'Replan from run_command')}"
+                    elif isinstance(run_command_output, str): # Normal string output from run_command
+                        self._log_to_memory("COMMAND_SUCCESS", f"Successfully ran: {args[0][:100]}", priority=5)
+                        yield {"type": "system", "content": run_command_output}
+                    else: # Unexpected output type from run_command
+                        yield {"type": "error", "content": f"❌ Unexpected output type from run_command: {str(run_command_output)[:100]}"}
+
+                else: # For other commands like create_file, write_to_file, delete_file, rename_file, set_user_preference, get_user_preference
+                    string_result_from_command = self.command_handlers[func_name](*args)
+                    yield {"type": "system", "content": string_result_from_command}
+
+                    if isinstance(string_result_from_command, str) and "✅" in string_result_from_command:
+                        # Common logic for successful file-changing operations (excluding generate_image, run_command)
+                        if func_name in ["create_file", "write_to_file", "delete_file", "rename_file"]:
+                            if "recent_changes" not in self.project_context:
+                                self.project_context["recent_changes"] = []
+                            self.project_context["recent_changes"].append({
+                                "command": func_name,
+                                "args": args,
+                                "timestamp": time.time()
+                            })
+                            self.project_context["recent_changes"] = self.project_context["recent_changes"][-20:]
+                            self.project_files_changed = True # Mark cache dirty
+
+                            # Yield specific file_changed events for these ops for UI updates
+                            if func_name == "create_file" and args: yield {"type": "file_changed", "content": args[0]}
+                            elif func_name == "write_to_file" and args: yield {"type": "file_changed", "content": args[0]}
+                            elif func_name == "delete_file" and args: yield {"type": "file_changed", "content": args[0]} # UI might need to know what was deleted
+                            elif func_name == "rename_file" and len(args) > 1: yield {"type": "file_changed", "content": args[1]} # New path
+
+                        # For preference commands, also log to memory (already done in methods)
+                        # No project_files_changed needed for set/get preference.
+
             except SyntaxError as se:
                 error_msg = f"Command syntax error: Unable to parse '{command_str}'. Error: {se}"
                 self._log_to_memory("ERROR", error_msg, priority=1)
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": f"❌ Command syntax error: `{command_str}`"}
-            except ValueError as ve:
+            except ValueError as ve: # This might catch general ValueErrors if ast.literal_eval specific one is missed
                 error_msg = f"Command value error: Problem with argument values in '{command_str}'. Error: {ve}"
                 self._log_to_memory("ERROR", error_msg, priority=1)
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": f"❌ Command value error: `{command_str}`"}
             except Exception as e:
-                error_msg = f"Unexpected command execution error for '{command_str}'. Error: {type(e).__name__} - {e}"
+                # Log args if available, otherwise indicate they are not
+                args_for_log = "unavailable"
+                try:
+                    args_for_log = str(args) if 'args' in locals() else "not populated before error"
+                except Exception: # Guard against issues stringifying args
+                    args_for_log = "error stringifying args"
+
+                error_msg = f"Unexpected command execution error for '{command_str}'. Error: {type(e).__name__} - {e}. Args: {args_for_log}"
                 self._log_to_memory("ERROR", error_msg, priority=1)
                 self.error_context.append(error_msg)
                 yield {"type": "error", "content": f"❌ Unexpected error processing command: `{command_str}`"}
@@ -2330,18 +2360,30 @@ Focus on actionable improvements that leverage all three agent perspectives.
             return 85
         return sum(grades) // len(grades)
 
-    def _safe_path(self, filename):
-        """Sanitize file paths to ensure they are within VM_DIR and prevent traversal."""
-        if not filename:
+    def _safe_path(self, filename_str: str):
+        if not filename_str:
             return None
-        if Path(filename).is_absolute():
+
+        p_filename = Path(filename_str)
+
+        if p_filename.is_absolute():
             return None
-        abs_vm_dir = os.path.abspath(VM_DIR)
-        full_path = VM_DIR / filename
-        abs_full_path = os.path.abspath(full_path)
-        if os.path.commonprefix([abs_full_path, abs_vm_dir]) != abs_vm_dir:
+
+        normalized_relative_path_str = os.path.normpath(str(p_filename))
+
+        if normalized_relative_path_str.startswith('..') or Path(normalized_relative_path_str).is_absolute():
             return None
-        return full_path
+
+        vm_abs_path = VM_DIR.resolve()
+        full_abs_path = (vm_abs_path / normalized_relative_path_str).resolve()
+
+        if vm_abs_path != Path(os.path.commonpath([vm_abs_path, full_abs_path])):
+            return None
+
+        path_inside_vm = full_abs_path.relative_to(vm_abs_path)
+        final_path = VM_DIR / path_inside_vm
+
+        return final_path
 
     def _create_file(self, path, content=""):
         """Create new file with enhanced error handling"""
