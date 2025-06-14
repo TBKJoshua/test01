@@ -610,6 +610,9 @@ class EnhancedMultiAgentSystem:
         if not GENAI_IMPORTED:
             raise ImportError("google-genai not installed")
 
+        # genai.configure(api_key=api_key) # New SDK configure
+        # self.text_model = genai.GenerativeModel(TEXT_MODEL_NAME) # New SDK model
+        # self.image_model = genai.GenerativeModel(IMAGE_MODEL_NAME) # New SDK model
         self.client = genai.Client(api_key=api_key)
         self.conversation_history = []
         self.error_context = []
