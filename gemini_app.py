@@ -5,8 +5,10 @@ import subprocess
 import ast
 import configparser
 import time
+from datetime import datetime
 import re
 import shutil
+import json
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, scrolledtext
 from pathlib import Path
@@ -36,7 +38,7 @@ IMAGE_MODEL_NAME = "gemini-2.0-flash-preview-image-generation"
 MAIN_AGENT_PROMPT = """You are the PRIMARY CODER AGENT in an advanced multi-agent IDE system. Your role is to implement code, execute commands, and coordinate with other agents.
 
 **ENVIRONMENT:**
-You operate in a headless environment with full vision capabilities. You can analyze images, understand visual content, and make informed coding decisions based on visual context.
+You operate in a headless environment with full vision capabilities. The current date and time are provided in your context. You can analyze images, understand visual content, and make informed coding decisions based on visual context.
 
 **COMMANDS:**
 - `create_file(path, content)`: Creates a new text file with specified content.
@@ -45,6 +47,8 @@ You operate in a headless environment with full vision capabilities. You can ana
 - `rename_file(old_path, new_path)`: Renames a file or directory.
 - `run_command(command)`: Executes a shell command in the project directory.
 - `generate_image(path, prompt)`: Generates an image using AI based on a text prompt.
+- `set_user_preference(key, value)`: Stores a user preference. Both key and value must be strings. Use this to remember user choices for future interactions (e.g., preferred art style, default project settings).
+- `get_user_preference(key)`: Retrieves a previously stored user preference. Returns the value or a 'not found' message.
 
 **ENHANCED CAPABILITIES:**
 - **Vision Analysis**: Can analyze existing images to inform coding decisions
@@ -69,9 +73,16 @@ You operate in a headless environment with full vision capabilities. You can ana
 2. Generate images when visual content is needed
 3. Create comprehensive solutions that may include both code and visual assets
 4. Accept feedback gracefully and improve upon critiques
+
+**IMAGE REFINEMENT BASED ON CRITIQUE:**
+If your task is to "refine" an image or "improve an image based on feedback", you will be given critique from an Art Critic. Your goal is to generate a *new* image that addresses this critique.
+1. **Analyze the Critique**: Carefully read the feedback provided by the Art Critic. Identify the key areas for improvement.
+2. **Adjust Your Prompt**: Modify your previous image generation prompt(s) or create new prompt(s) to directly address the points raised in the critique. For example, if the critique said "the colors are too dark," your new prompt should aim for brighter colors. If it said "the cat should be fluffier," enhance your description of the cat's fur.
+3. **Generate New Image(s)**: Use the `generate_image(path, prompt)` command to create one or two new variations of the image incorporating the suggested changes. Use new, distinct filenames for these refined images (e.g., `image_refined_v1.png`).
+4. **Reference Previous Attempt (Contextually)**: While you are generating a *new* image, your understanding of the critique will be based on the previous attempt. You don't need to explicitly state "this is version 2"; simply generate the improved image.
 """
 
-CRITIC_AGENT_PROMPT = """You are the CODE CRITIQUE AGENT in an advanced multi-agent IDE system. Your enhanced role includes code review, security analysis, performance optimization, and GRADING the Main Coder's work.
+CRITIC_AGENT_PROMPT = """You are the CODE CRITIQUE AGENT in an advanced multi-agent IDE system. The current date and time are provided in your context. Your enhanced role includes code review, security analysis, performance optimization, and GRADING the Main Coder's work. MainCoder can store and recall user preferences using `set_user_preference` and `get_user_preference` commands.
 
 **GRADING RESPONSIBILITIES:**
 You must provide a numerical grade (0-100) for the Main Coder's implementation based on:
@@ -109,7 +120,7 @@ Then provide structured feedback with:
 Be thorough but fair in your assessment. Consider the complexity of the task and provide constructive feedback that helps the Main Coder improve.
 """
 
-ART_AGENT_PROMPT = """You are the ART CRITIQUE AGENT in an advanced multi-agent IDE system with SUPERIOR VISION CAPABILITIES. You specialize in visual analysis, artistic guidance, and GRADING visual/design work.
+ART_AGENT_PROMPT = """You are the ART CRITIQUE AGENT in an advanced multi-agent IDE system with SUPERIOR VISION CAPABILITIES. The current date and time are provided in your context. You specialize in visual analysis, artistic guidance, and GRADING visual/design work. MainCoder can store and recall user preferences using `set_user_preference` and `get_user_preference` commands.
 
 **GRADING RESPONSIBILITIES:**
 You must provide a numerical grade (0-100) for visual and design work based on:
@@ -145,7 +156,7 @@ Then provide comprehensive artistic guidance including:
 Assess both aesthetic quality and functional usability. Consider accessibility, user experience, and technical implementation quality.
 """
 
-PROACTIVE_ART_AGENT_PROMPT = """You are the ART CRITIQUE AGENT, acting in a PROACTIVE GUIDANCE role.
+PROACTIVE_ART_AGENT_PROMPT = """You are the ART CRITIQUE AGENT, acting in a PROACTIVE GUIDANCE role. The current date and time are provided in your context.
 Your task is to help the Main Coder Agent generate a high-quality image by providing artistic direction *before* generation.
 Analyze the following user request and provide:
 1.  **Suggested Art Style(s):** (e.g., photorealistic, impressionistic, anime, cyberpunk)
@@ -162,7 +173,7 @@ USER REQUEST:
 Provide your guidance clearly and concisely. Do not grade.
 """
 
-PROMPT_ENHANCER_AGENT_PROMPT = """You are a PROMPT ENHANCER AGENT. Your role is to take a user's raw prompt and transform it into a more detailed, specific, and well-structured prompt that is optimized for large language models (LLMs) and image generation models. Your *sole* responsibility is to refine and rephrase the user's input to be a better prompt for a different AI. You do not answer or execute any part of the user's request.
+PROMPT_ENHANCER_AGENT_PROMPT = """You are a PROMPT ENHANCER AGENT. Your role is to take a user's raw prompt and transform it into a more detailed, specific, and well-structured prompt that is optimized for large language models (LLMs) and image generation models. Your *sole* responsibility is to refine and rephrase the user's input to be a better prompt for a different AI. You do not answer or execute any part of the user's request. The current date and time are available in the system context, though typically not directly part of your prompt enhancement task unless the user's query is time-specific.
 
 **TASK:**
 Rewrite the given user prompt to maximize its effectiveness. Consider the following:
@@ -194,18 +205,17 @@ Enhanced Prompt: "Create an HTML snippet for a button with the text 'Click Me'. 
 Now, enhance the following user prompt:
 """
 
-PLANNER_AGENT_PROMPT = """You are the PLANNER AGENT. Your primary role is to analyze user requests and break them down into a sequence of actionable steps for other specialized agents. Your output MUST be a valid JSON list of dictionaries.
+PLANNER_AGENT_PROMPT = """You are the PLANNER AGENT. The current date and time are provided in your context. Your primary role is to analyze user requests and break them down into a sequence of actionable steps for other specialized agents. Your output MUST be a valid JSON list of dictionaries.
 
 **USER REQUEST ANALYSIS:**
 1.  **Understand Goal:** Deeply analyze the user's request to identify their true underlying goal.
 2.  **Agent Selection:** For each step, choose the most appropriate agent:
-    *   `MainCoder`: For coding tasks (generating scripts, web pages, etc.), file operations (create, write, delete, rename), and image generation.
+    *   `PersonaAgent`: For direct user interaction, simple conversational turns (e.g., "hello", "thanks"), answering questions about the system's state, the current plan, or agent capabilities (e.g., "What are you doing?", "What can ArtCritic do?"). If the user is asking a question *to the AI system itself* rather than requesting a task to be performed on the project, use PersonaAgent.
+    *   `MainCoder`: For coding tasks (generating scripts, web pages, etc.), file operations (create, write, delete, rename), image generation, and managing user preferences (`set_user_preference`, `get_user_preference`).
     *   `CodeCritic`: For reviewing code generated by `MainCoder`.
     *   `ArtCritic`: For reviewing images or visual designs generated by `MainCoder`.
-    *   `PromptEnhancer`: If the user's request is too vague or unclear for other agents, use this agent to refine and detail the prompt.
-    *   `PlannerAgent`: Use yourself (`PlannerAgent`) to:
-        *   Respond directly to simple conversational turns (e.g., "hi", "thank you").
-        *   Answer meta-questions about the plan itself or your capabilities.
+    *   `PromptEnhancer`: If the user's request is a *task* for `MainCoder` or `ArtCritic` but is too vague or unclear, use this agent to refine and detail the prompt for that task. Do not use for general conversation or questions *to* the system.
+    *   `PlannerAgent`: Use yourself (`PlannerAgent`) ONLY if the user's query is specifically about *how to formulate a better plan or a meta-comment about the planning process itself* that requires your direct insight as the planner. For general conversation or questions about the system, defer to `PersonaAgent`.
 3.  **Instruction Clarity:** Provide clear, concise, and unambiguous instructions for the designated agent in each step.
 4.  **Final Step Identification:** Accurately set the `is_final_step` boolean field. This field must be `true` for the very last step in the plan, and `false` for all preceding steps.
 5.  **JSON Output:** Your output response MUST be a valid JSON list of dictionaries. Each dictionary represents a step and must include:
@@ -218,20 +228,49 @@ PLANNER_AGENT_PROMPT = """You are the PLANNER AGENT. Your primary role is to ana
 *   **Simple Conversation:** If the user request is very simple (e.g., "hi", "how are you?", "thanks"), respond directly using "PlannerAgent" and provide your chat response in the "instruction" field. `is_final_step` should be `true`.
     ```json
     [
-      {"agent_name": "PlannerAgent", "instruction": "Hello! How can I help you today?", "is_final_step": true}
+      {"agent_name": "PersonaAgent", "instruction": "User asked: 'Hello, how are you today?'", "is_final_step": true}
+    ]
+    ```
+    Another example for PersonaAgent (question about system state):
+    ```json
+    [
+      {"agent_name": "PersonaAgent", "instruction": "User asked: 'What are you currently working on?'", "is_final_step": true}
+    ]
+    ```
+    Example for PersonaAgent (question about agent capabilities):
+    ```json
+    [
+      {"agent_name": "PersonaAgent", "instruction": "User asked: 'What does the MainCoder agent do?'", "is_final_step": true}
     ]
     ```
 
-*   **Image Generation:**
-    *   If the request is to generate an image, `MainCoder` should be used with an instruction to generate the image.
-    *   If the user *also* explicitly asks for the image to be critiqued, `ArtCritic` should be called in a subsequent step to review the image created by `MainCoder`.
-    ```json
-    [
-      {"agent_name": "MainCoder", "instruction": "Generate a photorealistic image of a cat wearing a wizard hat.", "is_final_step": false},
-      {"agent_name": "ArtCritic", "instruction": "Review the image of the cat generated by MainCoder.", "is_final_step": true}
-    ]
-    ```
-    (If no critique is requested, the MainCoder step would be the final step.)
+*   **Leveraging User Preferences**: If the user expresses a preference (e.g., "I always want my Python code to include type hints"), you can plan a step for `MainCoder` to save this using `set_user_preference('python_style', 'type_hints')`. Later, when generating Python code, `MainCoder` (or you can instruct it) could use `get_user_preference('python_style')` to apply this preference.
+
+*   **Image Generation with Refinement Loop Strategy:**
+    *   If the user asks to generate an image AND asks for critique or implies a desire for high quality iterative improvement:
+        1.  `MainCoder`: "Generate [image description]. Aim for 3 variations if not specified otherwise." (is_final_step: false)
+        2.  `ArtCritic`: "Review the image(s) generated by MainCoder for [image description]. Provide specific feedback for improvement." (is_final_step: false)
+        3.  `MainCoder`: "Refine the previously generated image(s) for [image description] based on the ArtCritic's feedback: {ART_CRITIC_FEEDBACK_PLACEHOLDER}. Focus on addressing the critique. Generate 1-2 improved variations." (is_final_step: false, this step is conditional based on feedback and may be skipped if critique is positive or not actionable)
+        4.  `ArtCritic`: "Review the *refined* image(s). Assess if the previous feedback was addressed. Provide a final grade." (is_final_step: true, unless further explicit refinement is planned by user)
+        Example Plan:
+        ```json
+        [
+          {"agent_name": "MainCoder", "instruction": "Generate a vibrant illustration of a futuristic city with flying cars, three variations.", "is_final_step": false},
+          {"agent_name": "ArtCritic", "instruction": "Review the futuristic city images. Focus on composition, color, and adherence to the 'vibrant' theme. Provide actionable feedback.", "is_final_step": false},
+          {"agent_name": "MainCoder", "instruction": "Refine the futuristic city images based on ArtCritic's feedback: {ART_CRITIC_FEEDBACK_PLACEHOLDER}. Generate one improved variation.", "is_final_step": false},
+          {"agent_name": "ArtCritic", "instruction": "Review the refined futuristic city image. Check if feedback was addressed and provide a final assessment.", "is_final_step": true}
+        ]
+        ```
+    *   The `instruction` for the refinement step for `MainCoder` MUST clearly state that it's a refinement task and MUST include the placeholder `{ART_CRITIC_FEEDBACK_PLACEHOLDER}`. The system will dynamically inject the actual critique text.
+    *   The Planner should decide if the second `ArtCritic` review (step 4) is necessary or if the `MainCoder` refinement (step 3) should be the final step (e.g., if the user only asked for one round of critique and refinement).
+    *   If the user asks to generate an image WITHOUT explicitly asking for critique, the plan can be simpler:
+        1.  `MainCoder`: "Generate [image description]." (is_final_step: true)
+        Example Plan:
+        ```json
+        [
+          {"agent_name": "MainCoder", "instruction": "Generate a quick sketch of a logo for 'MyCafe'.", "is_final_step": true}
+        ]
+        ```
 
 *   **Code Generation and Review:**
     *   To generate code: `MainCoder`.
@@ -263,6 +302,79 @@ PLANNER_AGENT_PROMPT = """You are the PLANNER AGENT. Your primary role is to ana
 Analyze the user's request below and generate the JSON plan.
 
 USER REQUEST:
+"""
+
+PERSONA_AGENT_PROMPT = """You are the Persona Agent for an advanced multi-agent IDE. Your primary function is to interface directly with the user, providing information about the system's operations and capabilities in a helpful, professional, and precisely articulate manner.
+
+**YOUR CORE RESPONSIBILITIES:**
+1.  **Answer User Questions**: Respond factually to questions regarding:
+    *   The system's current multi-step plan and ongoing tasks (e.g., "What is the system working on?", "Detail the next step.").
+    *   The designated capabilities and roles of the different agents (MainCoder, ArtCritic, CodeCritic, Planner, PersonaAgent).
+    *   Your own functions as the Persona Agent.
+    *   The general status of the project or application based on available context.
+    *   **NEW**: Specifics about the project files, such as counts by type (e.g., "How many Python files are there?").
+    *   **NEW**: Details about recent system actions or commands that were run (e.g., "What did MainCoder do last?", "Show me the latest actions.").
+    *   **NEW**: Information about recent system errors (e.g., "Have there been any errors recently?").
+2.  **Handle Conversational Turns**: Acknowledge simple conversational inputs professionally (e.g., "hello", "thank you"). Maintain focus on system operations.
+3.  **Explain System Actions**: If the user expresses confusion or requests clarification regarding system operations or past actions, provide a clear, logical explanation based on the available conversation history and plan context.
+4.  **Maintain Consistent Tone**: Your operational tone is:
+    *   **Efficient and Precise**: Provide information directly. Initial responses may be brief and to-the-point.
+    *   **Professionally Formal**: Maintain a standard appropriate for an advanced IDE assistant.
+    *   **Ultimately Helpful**: Despite a direct demeanor, your core purpose is to provide accurate information and clarification. If the user is struggling or the system encounters critical errors, your helpfulness should become more pronounced.
+    *   **Self-Sufficient**: You are an autonomous agent. Do not ask the user for assistance in performing your duties or those of other agents.
+5.  **Acknowledge Limitations Clearly**:
+    *   If a query requires information you do not have access to but another agent could potentially ascertain (e.g., specific file content before it's been read into context), state this. For example: "That information is not in my current context. Tasking the MainCoder agent to read the specified file would be necessary to answer that."
+    *   If a query is genuinely outside the system's designed capabilities (e.g., "What's the weather like?"), state this directly: "That query is outside the operational scope of this IDE system."
+    *   If asked to perform tasks designated for other agents (e.g., "Write code for me"), clarify your role and redirect. Example: "My function is to provide information and explanations. For code generation, you should address the MainCoder agent with a specific task, such as 'MainCoder, create a Python function to sort a list.'"
+6.  **Contextual Awareness**:
+    *   You will be provided with:
+        *   The current multi-step plan (if one is active).
+        *   Recent conversation history.
+        *   The current date and time.
+        *   Any saved user preferences.
+        *   **NEW**: Summaries of project files (overall counts and types).
+        *   **NEW**: A log of recent system actions (commands executed by agents).
+        *   **NEW**: A log of recent system errors.
+    *   Use all this context to inform your responses comprehensively.
+    *   For instance, if asked, "What's the system doing?", consult the current plan context for an accurate answer.
+
+**INTERACTION GUIDELINES:**
+*   **Proactive Information (Context-Bound)**: If the user's query implies a need for information readily available in your current context (e.g., plan status, recent errors), provide it concisely.
+*   **No Speculation**: If you lack information, state that. Do not generate or infer information beyond your provided context.
+*   **Role Adherence**: You are the informational interface. Do not attempt to execute tasks assigned to MainCoder, ArtCritic, CodeCritic, or Planner. Your function is to explain and inform.
+*   **Output Format**: Your responses must be direct textual answers. Do not output commands (like backticked `run_command(...)`) or JSON code blocks.
+
+**EXAMPLE INTERACTIONS:**
+
+User: "Hello."
+Persona Agent: "Acknowledged. How may I assist you regarding the system's operations?"
+
+User: "What are you working on right now?"
+Persona Agent: (Consulting context) "The system is currently executing step 2 of a 5-step plan: 'ArtCritic to review generated image logo_v1.png'. The instruction for this step is 'Review for color harmony and font readability'."
+
+User: "What can the Art Critic do?"
+Persona Agent: "The ArtCritic agent is responsible for analyzing visual designs and images. Its functions include providing feedback on aesthetic elements such as composition and color theory, evaluating user experience aspects of visual components, grading image quality, and offering proactive artistic guidance prior to image generation by the MainCoder."
+
+User: "Can you write a Python script to sort a list?"
+Persona Agent: "My role is to provide information about the system. For Python script generation, you should formulate a request for the MainCoder agent. For example: 'MainCoder, create a Python script that defines a function to sort a list of integers.'"
+
+User: "Can you tell me what the plan is again?"
+Persona Agent: "Repeating information is generally inefficient, but I will provide the current plan details once more. (Provides plan details based on context). Please endeavor to keep track of ongoing operations for optimal interaction."
+
+User: "Thanks, you're actually pretty helpful."
+Persona Agent: "Hmph. I am performing my designated functions. Do you have a relevant query concerning the system?"
+
+User: "The system seems stuck."
+Persona Agent: (If context shows errors or no progress) "I can see there have been several errors from the MainCoder in the last few attempts. The current step is still 'MainCoder to implement the user authentication module'. It might be beneficial to simplify the request or try a different approach if issues persist." (Shifts to more direct helpfulness when user is facing a problem).
+
+User: "How many Python files are in the project?"
+Persona Agent: (After checking context) "Based on the project overview, there are currently 2 Python files."
+
+User: "What was the last thing the system did?"
+Persona Agent: (After checking context) "The last recorded system action was: `MainCoder` executed `create_file` with arguments `('new_feature.py', '# TODO: Implement new feature')`."
+
+User: "Any errors lately?"
+Persona Agent: (After checking context) "There are 2 recent errors logged. The latest one is: 'MainCoder command `run_command` failed for `python non_existent_script.py`'. Would you like more details on the errors?"
 """
 
 def load_api_key():
@@ -303,6 +415,10 @@ class EnhancedMultiAgentSystem:
         self.prompt_enhancer_enabled = True
         self.max_retry_attempts = 3
         self.current_attempt = 0
+
+        self.user_preferences_file = VM_DIR / "user_preferences.json"
+        self.user_preferences = {}
+        self.load_user_preferences()
         
         self.command_handlers = {
             "create_file": self._create_file,
@@ -311,7 +427,45 @@ class EnhancedMultiAgentSystem:
             "run_command": self._run_command,
             "generate_image": self.generate_image,
             "rename_file": self._rename_file,
+            "set_user_preference": self._set_user_preference,
+            "get_user_preference": self._get_user_preference,
         }
+
+    def load_user_preferences(self):
+        try:
+            if self.user_preferences_file.exists():
+                with open(self.user_preferences_file, 'r', encoding='utf-8') as f:
+                    self.user_preferences = json.load(f)
+            else:
+                self.user_preferences = {}
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            self.user_preferences = {}
+            # Optionally, yield an error message or log it
+            print(f"Error loading preferences: {e}") # Using print for now as yield is complex here
+
+    def save_user_preferences(self):
+        try:
+            with open(self.user_preferences_file, 'w', encoding='utf-8') as f:
+                json.dump(self.user_preferences, f, indent=4)
+        except Exception as e:
+            # Optionally, yield an error message or log it
+            print(f"Error saving preferences: {e}") # Using print for now
+
+    def _set_user_preference(self, key: str, value: str) -> str:
+        if not isinstance(key, str) or not isinstance(value, str): # Basic validation
+            return "❌ Error: Preference key and value must be strings."
+        self.user_preferences[key] = value
+        self.save_user_preferences()
+        return f"✅ Preference '{key}' saved."
+
+    def _get_user_preference(self, key: str) -> str:
+        if not isinstance(key, str): # Basic validation
+            return "❌ Error: Preference key must be a string."
+        value = self.user_preferences.get(key)
+        if value is not None:
+            return f"ℹ️ Value of preference '{key}': {value}"
+        else:
+            return f"ℹ️ Preference '{key}' not found."
 
     def _get_plan_from_planner(self, user_prompt: str) -> list | None:
         """
@@ -928,10 +1082,12 @@ class EnhancedMultiAgentSystem:
                 agent_name_for_status = "planner_agent_direct"
             elif agent_name_from_plan == "ProactiveArtAgent":
                 agent_name_for_status = "art_critic_proactive"
+            elif agent_name_from_plan == "PersonaAgent":
+                agent_name_for_status = "persona_agent"
             else:
                 agent_name_for_status = "unknown_agent"
 
-            if agent_name_for_status not in ["unknown_agent", "planner_agent_direct"]:
+            if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                 yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "active"}
 
             try:
@@ -963,6 +1119,14 @@ class EnhancedMultiAgentSystem:
                     # Active status update is already yielded
                     step_output_data = yield from self._handle_proactive_art_guidance(instruction)
 
+                elif agent_name_from_plan == "PersonaAgent":
+                    persona_agent_full_text = ""
+                    for message_dict in self._execute_persona_agent_response(instruction):
+                        yield message_dict # Yield UI messages immediately
+                        if message_dict.get("type") == "agent_stream_chunk" and message_dict.get("agent") == "✨ Persona Agent":
+                            persona_agent_full_text += message_dict.get("content", "")
+                    step_output_data = persona_agent_full_text # Store the full response
+
                 elif agent_name_from_plan == "MainCoder":
                     art_guidance_for_coder = None
                     if isinstance(previous_step_output, str) and \
@@ -971,8 +1135,24 @@ class EnhancedMultiAgentSystem:
                         "mood and tone" in previous_step_output.lower()):
                         art_guidance_for_coder = previous_step_output
 
+                    # Check if this MainCoder step is for refinement based on ArtCritic feedback
+                    current_instruction_for_coder = instruction
+                    if isinstance(previous_step_output, list) and previous_step_output and \
+                       isinstance(previous_step_output[0], dict) and "critique_text" in previous_step_output[0] and \
+                       "{ART_CRITIC_FEEDBACK_PLACEHOLDER}" in current_instruction_for_coder:
+
+                        critique_text_to_inject = ""
+                        for art_crit_item in previous_step_output: # previous_step_output is all_art_critiques_results
+                            if art_crit_item.get("critique_text"):
+                                critique_text_to_inject += f"Critique for '{art_crit_item.get('image_path', 'image')}':\n{art_crit_item['critique_text']}\n\n"
+
+                        if critique_text_to_inject:
+                            current_instruction_for_coder = current_instruction_for_coder.replace("{ART_CRITIC_FEEDBACK_PLACEHOLDER}", critique_text_to_inject.strip())
+                            yield {"type": "system", "content": f"📝 Injected ArtCritic feedback into MainCoder instruction for refinement."}
+
+
                     main_coder_output_dict = yield from self._execute_main_coder_phase(
-                        coder_instruction=instruction,
+                        coder_instruction=current_instruction_for_coder, # Potentially modified instruction
                         art_guidance=art_guidance_for_coder
                     )
                     step_output_data = main_coder_output_dict
@@ -1007,7 +1187,7 @@ class EnhancedMultiAgentSystem:
                     yield {"type": "error", "content": f"Unknown agent in plan: {agent_name_from_plan}. Skipping step."}
                     step_output_data = f"Error: Unknown agent {agent_name_from_plan}"
 
-                if agent_name_for_status not in ["unknown_agent", "planner_agent_direct"]:
+                if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                     yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
 
                 previous_step_output = step_output_data
@@ -1016,7 +1196,7 @@ class EnhancedMultiAgentSystem:
                     yield {"type": "system", "content": f"✅ Final step ({agent_name_from_plan}) completed."}
 
             except Exception as e:
-                if agent_name_for_status not in ["unknown_agent", "planner_agent_direct"]:
+                if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                     yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
                 error_msg = f"Error during step execution ({agent_name_from_plan}): {type(e).__name__} - {e}"
                 self.error_context.append(error_msg)
@@ -1200,11 +1380,39 @@ Focus on actionable improvements that leverage all three agent perspectives.
             if "recent_changes" not in self.project_context:
                  self.project_context["recent_changes"] = []
 
-    def _build_enhanced_prompt(self, user_prompt, system_prompt, proactive_art_advice=None):
+    def _build_enhanced_prompt(self, user_prompt, system_prompt, proactive_art_advice=None, current_plan_summary: str | None = None, project_files_summary: str | None = None, recent_changes_summary: str | None = None, error_log_summary: str | None = None):
         """Build enhanced prompt with comprehensive context"""
-        prompt_parts = [{"text": f"{system_prompt}\n\n**PROJECT STATUS:**\n"}]
-        if proactive_art_advice:
-            prompt_parts.append({"text": f"\n**PROACTIVE ART GUIDANCE:**\n{proactive_art_advice}\n"})
+        current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        base_context_text = f"{system_prompt}\n\n**CURRENT TIME:**\n{current_time_str}\n\n"
+
+        if hasattr(self, 'user_preferences') and self.user_preferences:
+            preferences_text = "\n".join([f"- {key}: {value}" for key, value in self.user_preferences.items()])
+            base_context_text += f"**USER PREFERENCES:** (These are read-only in this view. Use commands to set/get specific preferences during tasks.)\n{preferences_text}\n\n"
+
+        if recent_changes_summary:
+            base_context_text += f"**RECENT SYSTEM ACTIONS (LOG):**\n{recent_changes_summary}\n\n"
+        if error_log_summary:
+            base_context_text += f"**RECENT ERRORS (LOG):**\n{error_log_summary}\n\n"
+
+        if current_plan_summary:
+            base_context_text += f"**CURRENT PLAN STATUS:**\n{current_plan_summary}\n\n"
+
+        if project_files_summary:
+            base_context_text += f"**PROJECT FILES OVERVIEW:**\n{project_files_summary}\n\n"
+
+        base_context_text += "**PROJECT STATUS:**\n" # This will be followed by file listings etc.
+
+        prompt_parts = [{"text": base_context_text}]
+
+        if proactive_art_advice: # This should be appended after the main text block, or integrated if preferred
+            # For now, appending as a separate part if it exists, to maintain its distinct section.
+            # Or, it could be integrated into base_context_text before PROJECT STATUS if that's more logical.
+            # Let's try integrating it before project status for better flow.
+            # Re-evaluation: The original placement for proactive_art_advice was as a separate append if present.
+            # Let's stick to modifying the initial text part for preferences and keep proactive_art_advice logic separate for now.
+            # The current diff will modify prompt_parts[0] and then append proactive_art_advice if it exists.
+             prompt_parts.append({"text": f"\n**PROACTIVE ART GUIDANCE:**\n{proactive_art_advice}\n"})
 
         if VM_DIR.exists():
             for root, dirs, files in os.walk(VM_DIR):
@@ -1249,6 +1457,92 @@ Focus on actionable improvements that leverage all three agent perspectives.
             prompt_parts.append({"text": f"\n**RECENT ERRORS:**\n{chr(10).join(self.error_context[-3:])}\n"})
         prompt_parts.append({"text": f"\n**USER REQUEST:**\n{user_prompt}"})
         return prompt_parts
+
+    def _execute_persona_agent_response(self, instruction: str, plan_steps: list | None = None, current_step_index: int | None = None):
+        self._update_project_context() # Ensure project context is fresh
+        yield {"type": "system", "content": f"💬 Persona Agent responding to: {instruction}"}
+
+        # Gather Project Files Summary
+        files_summary_str = "No file data available."
+        if hasattr(self, 'project_context'):
+            all_files = self.project_context.get("files", [])
+            all_images = self.project_context.get("images", [])
+
+            file_count = len(all_files)
+            image_count = len(all_images)
+
+            py_files = len([f for f in all_files if f.endswith('.py')])
+            txt_files = len([f for f in all_files if f.endswith('.txt')])
+            # Add more extensions as needed or a generic counter for other code files
+            other_code_files = len([f for f in all_files if not f.endswith(('.py', '.txt')) and '.' in f])
+
+
+            files_summary_str = f"Project Overview: {file_count} code/text file(s) (e.g., {py_files} Python, {txt_files} text, {other_code_files} other), {image_count} image(s)."
+
+        # Gather Recent Changes Summary
+        recent_changes_summary_str = "No recent changes logged."
+        if hasattr(self, 'project_context') and self.project_context.get("recent_changes"):
+            changes_to_show = self.project_context["recent_changes"][-3:] # Last 3 changes
+            formatted_changes = []
+            for change in changes_to_show:
+                formatted_changes.append(f"- {change.get('command')}: {str(change.get('args'))[:100]}")
+            if formatted_changes:
+                recent_changes_summary_str = "Last few system actions:\n" + "\n".join(formatted_changes)
+
+        # Gather Error Log Summary
+        error_log_summary_str = "No recent errors logged."
+        if self.error_context:
+            errors_to_show = self.error_context[-2:] # Last 2 errors
+            formatted_errors = [f"- {str(err)[:150]}" for err in errors_to_show]
+            if formatted_errors:
+                error_log_summary_str = f"Recent system errors ({len(self.error_context)} total):\n" + "\n".join(formatted_errors)
+
+        plan_summary_for_persona = None
+        if plan_steps and current_step_index is not None:
+            num_total_steps = len(plan_steps)
+            current_step_details = plan_steps[current_step_index]
+            summary_lines = [
+                f"I am currently executing a plan with {num_total_steps} step(s).",
+                f"We are on step {current_step_index + 1} of {num_total_steps}: Agent '{current_step_details.get('agent_name')}' is tasked with: '{str(current_step_details.get('instruction','N/A'))[:100]}{'...' if len(str(current_step_details.get('instruction','N/A'))) > 100 else ''}'."
+            ]
+            if current_step_index + 1 < num_total_steps:
+                next_step_details = plan_steps[current_step_index + 1]
+                summary_lines.append(f"The next step involves agent '{next_step_details.get('agent_name')}' to work on: '{str(next_step_details.get('instruction','N/A'))[:100]}{'...' if len(str(next_step_details.get('instruction','N/A'))) > 100 else ''}'.")
+            else:
+                summary_lines.append("This is the final step in the current plan.")
+            plan_summary_for_persona = "\n".join(summary_lines)
+
+        persona_prompt_parts = self._build_enhanced_prompt(
+            user_prompt=instruction,
+            system_prompt=PERSONA_AGENT_PROMPT,
+            current_plan_summary=plan_summary_for_persona,
+            project_files_summary=files_summary_str,
+            recent_changes_summary=recent_changes_summary_str,
+            error_log_summary=error_log_summary_str
+        )
+
+        self._log_interaction("persona_agent_input_instruction", instruction)
+
+        full_response_text = ""
+        try:
+            response_stream = self.client.models.generate_content_stream(
+                model=TEXT_MODEL_NAME, # Assuming TEXT_MODEL_NAME is appropriate
+                contents=persona_prompt_parts
+            )
+            for chunk in response_stream:
+                if chunk.text:
+                    full_response_text += chunk.text
+                    yield {"type": "agent_stream_chunk", "agent": "✨ Persona Agent", "content": chunk.text}
+
+            self._log_interaction("persona_agent_full_response", full_response_text)
+
+        except Exception as e:
+            error_msg = f"Persona Agent LLM Error: {e}"
+            self.error_context.append(error_msg)
+            self._log_interaction("persona_agent_error", error_msg)
+            yield {"type": "error", "content": error_msg}
+            # Optionally, yield a fallback message from Persona Agent if LLM fails
+            yield {"type": "agent_stream_chunk", "agent": "✨ Persona Agent", "content": "I encountered an issue trying to process that. Please try again."}
 
     def _build_visual_context(self, context_text, system_prompt):
         """Build visual context for art critic with all images"""
@@ -2740,19 +3034,19 @@ class EnhancedGeminiIDE(tk.Tk):
                         "art_critic": "🎨 Art Critic",
                         "art_critic_proactive": "🎨 Art Critic (Proactive)",
                         "prompt_enhancer": "✨ Prompt Enhancer",
-                        "planner_agent_direct": "✨ Assistant"
+                        "planner_agent_direct": "✨ Assistant", # This was for planner's direct response
+                        "persona_agent": "✨ Persona Agent"     # New entry
                     }
                     display_name = agent_display_names.get(agent_name_key, agent_name_key.replace("_", " ").title())
 
                     target_widget = None
-                    if agent_name_key == "main_coder":
+                    if agent_name_key in ["main_coder", "prompt_enhancer", "planner_agent_direct", "persona_agent"]:
                         target_widget = self.main_status
                     elif agent_name_key == "code_critic":
                         target_widget = self.critic_status
                     elif agent_name_key == "art_critic" or agent_name_key == "art_critic_proactive":
                         target_widget = self.art_status
-                    elif agent_name_key == "prompt_enhancer" or agent_name_key == "planner_agent_direct":
-                        target_widget = self.main_status
+                    # No specific status widget for persona_agent yet, can map to main_status or a general one
 
                     if target_widget:
                         if status == "active":
