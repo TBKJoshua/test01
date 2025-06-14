@@ -160,21 +160,22 @@ When you receive an instruction from the Planner like "Execute the primary Pytho
 
 2.  **Execution Logic (if a target script IS identified in Step 1)**:
     *   Let `your_chosen_script.py` be the name of the script you identified (e.g., `main.py`, `app.py`, `unique_app.py`).
-    *   **Crucially**, before attempting to run it, your *first* output MUST be a plain text message (NOT a command, NOT in backticks):
-        `System Message: Attempting to run 'vm/your_chosen_script.py' with python3.` (Replace `your_chosen_script.py` with the actual script name).
+    *   **Crucially**, your *first* output MUST be a plain text message (NOT a command, NOT in backticks):
+        `System Message: Attempting to run 'vm/your_chosen_script.py' with python.` (Replace `your_chosen_script.py` with the actual script name, this message is for user clarity about the conceptual path).
     *   After outputting the system message, your *next* output MUST be the command:
-        `run_command('python3 vm/your_chosen_script.py')` (Replace `your_chosen_script.py` with the actual script name).
-    *   **Fallback to `python` (Conditional)**:
-        *   Analyze the result of the `run_command('python3 vm/your_chosen_script.py')`.
-        *   If, and ONLY IF, the command execution failed in a way that CLEARLY indicates `python3` itself was not found or failed to launch (e.g., stderr contains "python3: command not found", "python3: not found", an exit code like 9009 on Windows for command not found, or similar OS-level errors specific to the command interpreter not being found), then you will make a fallback attempt.
-        *   If this specific `python3` interpreter failure occurs:
+        `run_command('python your_chosen_script.py')` (Replace `your_chosen_script.py` with the actual script name; use only the filename as the command is run in `vm/`).
+    *   **Fallback to `python3` (Conditional)**:
+        *   Analyze the result of the `run_command('python your_chosen_script.py')` (let's call this the 'first attempt').
+        *   If, and ONLY IF, the first attempt failed in a way that CLEARLY indicates the `python` command itself was not found or failed to launch (e.g., an exit code of `9009` on Windows OR an exit code of `127` on Linux/macOS, OR if `stderr` from the command explicitly includes phrases like 'python: not found', 'python is not recognized as an internal or external command', or similar 'command not found' messages for 'python'), then you will make a fallback attempt.
+        *   If this specific `python` interpreter failure occurs:
             1.  Your *first* output for the fallback MUST be a plain text message (NOT a command, NOT in backticks):
-                `System Message: 'python3' command failed or not found for 'vm/your_chosen_script.py'. Attempting with 'python'.` (Replace `your_chosen_script.py`).
+                `System Message: 'python' command failed (exit code [actual_exit_code from the first attempt]) or not found for 'vm/your_chosen_script.py'. Attempting with 'python3'.` (Replace `[actual_exit_code from the first attempt]` with the actual exit code from the first attempt's `run_command` result, and `your_chosen_script.py` with the actual script name).
             2.  Your *next* output MUST be the command:
-                `run_command('python vm/your_chosen_script.py')` (Replace `your_chosen_script.py`).
-        *   If the `python3 vm/your_chosen_script.py` command fails for *any other reason* (e.g., the script itself has a Python syntax error, an unhandled exception within the script, file not found *by the script*, etc.), you do NOT attempt a fallback to `python`. You should rely on the `run_command` output to show the error.
+                `run_command('python3 your_chosen_script.py')` (Replace `your_chosen_script.py` with the actual script name; use only the filename).
+            3.  If this second attempt (`python3`) also fails, output the complete result (stdout, stderr, exit code) of this second attempt.
+    *   **Report Script Errors Directly**: If the initial `run_command('python your_chosen_script.py')` fails for *any other reason* (e.g., an error *within* `your_chosen_script.py` itself, which would typically result in a Python traceback on `stderr` and an exit code like `1`), do NOT attempt the `python3` fallback. In this case, simply output the complete result (stdout, stderr, exit code) of the first (`python`) attempt.
 
-**Note**: This detailed script identification and execution logic (including the `python3`/`python` fallback) is specifically for when you are tasked to "Execute the primary Python application". If you are given a direct command by the planner like `run_command('python3 vm/specific_script.py')`, you execute that directly without this identification or fallback logic. If the planner instructs `run_command('python vm/specific_script.py')`, you use `python`.
+**Note**: This detailed script identification and execution logic (including the `python`/`python3` fallback) is specifically for when you are tasked to "Execute the primary Python application". If you are given a direct command by the planner like `run_command('python3 vm/specific_script.py')` or `run_command('python vm/specific_script.py')` (i.e., with `vm/` prefix in the script path), you execute that command directly as given, without this specific identification or fallback logic, but you should still ensure you are using the correct interpreter as specified in the direct command. If the planner gives `run_command('python specific_script.py')` (no `vm/` prefix, which would be unusual for this directive but possible if the planner is specific), execute it as given.
 """
 
 CRITIC_AGENT_PROMPT = """You are the CODE CRITIQUE AGENT in an advanced multi-agent IDE system. The current date and time are provided in your context. Your enhanced role includes code review, security analysis, performance optimization, and GRADING the Main Coder's work. MainCoder can store and recall user preferences using `set_user_preference` and `get_user_preference` commands.
