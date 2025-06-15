@@ -2338,8 +2338,16 @@ Focus on actionable improvements that leverage all three agent perspectives.
                     string_result_from_command = self.command_handlers[func_name](*args)
                     yield {"type": "system", "content": string_result_from_command}
 
+                is_successful_operation = False
+                if func_name == "delete_file":
+                    if isinstance(string_result_from_command, str) and "🗑️" in string_result_from_command:
+                        is_successful_operation = True
+                elif func_name in ["create_file", "write_to_file", "rename_file", "set_user_preference", "get_user_preference"]: # Assuming set/get also use ✅
                     if isinstance(string_result_from_command, str) and "✅" in string_result_from_command:
-                        # Common logic for successful file-changing operations (excluding generate_image, run_command)
+                        is_successful_operation = True
+                # Add other func_names here if they have different success indicators
+
+                if is_successful_operation:
                         if func_name in ["create_file", "write_to_file", "delete_file", "rename_file"]:
                             if "recent_changes" not in self.project_context:
                                 self.project_context["recent_changes"] = []
@@ -2356,6 +2364,9 @@ Focus on actionable improvements that leverage all three agent perspectives.
                             elif func_name == "write_to_file" and args: yield {"type": "file_changed", "content": args[0]}
                             elif func_name == "delete_file" and args: yield {"type": "file_changed", "content": args[0]} # UI might need to know what was deleted
                             elif func_name == "rename_file" and len(args) > 1: yield {"type": "file_changed", "content": args[1]} # New path
+
+                    # Specific logging/actions for set/get user preference can remain here if they were part of original logic
+                    # For example, if _set_user_preference already logs to memory, no extra action needed here.
 
                         # For preference commands, also log to memory (already done in methods)
                         # No project_files_changed needed for set/get preference.
@@ -3206,12 +3217,16 @@ class EnhancedGeminiIDE(tk.Tk):
 
     def refresh_files(self):
         """Enhanced file tree refresh with metadata, using caching."""
+        self.status_var.set("🔄 Refreshing file explorer...")
+        self.update_idletasks() # To ensure the status bar updates immediately
+        self.file_tree_cache_dirty = True # Ensure cache is always rebuilt on manual refresh
         self.tree.delete(*self.tree.get_children())
-        if self.file_tree_cache_dirty:
+        if self.file_tree_cache_dirty: # This will now always be true at this point of the if
             self.file_tree_cache.clear()
             self._rebuild_file_tree_cache(VM_DIR, self.file_tree_cache)
-            self.file_tree_cache_dirty = False
+            self.file_tree_cache_dirty = False # Reset after rebuilding
         self._populate_tree_from_cache("", self.file_tree_cache)
+        self.status_var.set(f"✅ File explorer refreshed. {len(self.tree.get_children())} top-level item(s) loaded.")
 
     def _rebuild_file_tree_cache(self, current_path_obj, current_cache_level):
         """Recursively builds the file tree cache."""
