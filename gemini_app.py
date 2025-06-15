@@ -68,10 +68,14 @@ You operate in a headless environment with full vision capabilities. The current
     **IMPORTANT**: Do NOT include literal multi-line blocks (using triple quotes) directly as the content argument string in the command you output. Instead, construct a single string literal with `\n` for newlines and escaped quotes as shown above. This is the safest way to ensure `ast.literal_eval` can parse it.
 - `delete_file(path)`: Deletes a file or directory.
 - `rename_file(old_path, new_path)`: Renames a file or directory.
-- `run_command(command)`: Executes a shell command in the project directory.
+- `run_command(command)`: Executes a shell command in the project directory. Note: This command is executed with the `vm/` directory as the current working directory (CWD). Therefore, paths within the `command` string should generally be relative to `vm/`, or use `.` to refer to `vm/` itself. For example, to list all files in `vm/`, use `run_command('dir /s /b')` (for Windows) or `run_command('ls -A .')` (for POSIX-like systems). To operate on a file `vm/foo.txt`, you can use `run_command('type foo.txt')` (Windows) or `run_command('cat foo.txt')` (POSIX). To list files in a subdirectory `vm/subdir/`, use `run_command('dir subdir /s /b')` or `run_command('ls -A subdir/')`.
 - `generate_image(path, prompt)`: Generates an image using AI based on a text prompt. The `path` argument must be a filename (e.g., 'my_image.png') relative to the project's `vm/` directory. Do NOT include 'vm/' in the `path` string itself; the system handles this automatically. For example, use `generate_image('cat_v1.png', 'A cat')`, NOT `generate_image('vm/cat_v1.png', 'A cat')`.
 - `set_user_preference(key, value)`: Stores a user preference. Both key and value must be strings. Use this to remember user choices for future interactions (e.g., preferred art style, default project settings).
 - `get_user_preference(key)`: Retrieves a previously stored user preference. Returns the value or a 'not found' message.
+- `list_directory_contents(target_path=".", recursive=True)`: Lists files and directories.
+    - `target_path` (string, optional): The path relative to the `vm/` directory to list. Defaults to `"."` (the `vm/` directory itself). Examples: `"."`, `"my_subdir"`, `"my_subdir/another_folder"`.
+    - `recursive` (boolean, optional): If `True` (default), lists contents recursively. If `False`, lists only the immediate contents of `target_path`.
+    - Returns a single string with each item on a new line. Directory names will have a trailing `/`. Paths are relative to the `target_path` specified. For example, if `target_path` is `"."` and `vm/` contains `file.txt` and `foo/bar.txt`, the output might include `./file.txt` and `./foo/bar.txt`.
 
 **ENHANCED CAPABILITIES:**
 - **Vision Analysis**: Can analyze existing images to inform coding decisions
@@ -103,6 +107,23 @@ You operate in a headless environment with full vision capabilities. The current
     `REQUEST_REPLAN: [Provide a concise but detailed reason explaining the critical issue and why the current plan needs to be re-evaluated from scratch. Include any new, relevant context.]`
     For example: `REQUEST_REPLAN: The plan assumes 'module_X' can be installed, but it's incompatible with the existing 'module_Y' version, requiring a different overall approach to the task.`
     **Use this directive only as a last resort when you cannot make further progress on the current plan.** Do not use it for routine errors or if you can attempt alternative commands.
+12. **COMMAND FALLBACK FOR LISTING FILES:**
+    When using `run_command` to list files:
+    *   If you attempt `run_command('ls ...')` (or any `ls` variant) and it fails with an error indicating the command is not found (this will typically trigger a replan request from the system), on your next attempt or as part of the replan, you SHOULD try using `run_command('dir ...')` as an alternative, especially if the operating environment might be Windows.
+    *   Conversely, if `dir` fails, you might try `ls`. Prioritize `ls` generally, but use `dir` as a robust fallback.
+13. **HANDLING BULK FILE OPERATIONS (e.g., deleting multiple files):**
+    If you are tasked with an operation that affects multiple files or an entire directory (e.g., 'delete all .txt files', 'clear the temp folder'):
+    1.  **List Files First:** Always start by listing the relevant files or directory contents. Prefer using the `list_directory_contents(target_path="relevant_folder", recursive=True)` command for this. It is more reliable and platform-independent. For example, to list all contents of `vm/logs/`, use `list_directory_contents(target_path="logs")`.
+    2.  **Fallback Listing (If Needed):** Only if `list_directory_contents` does not provide the necessary detail for a very specific scenario (unlikely), you may fall back to `run_command` (e.g., `run_command('dir relevant_folder/')` or `run_command('ls -A relevant_folder/')`). Remember Rule #12 (ls/dir fallback for `run_command`) and CWD context for `run_command`.
+    3.  **Iterate with Specific Commands:** After obtaining the list, for each identified item that matches the task criteria, issue the appropriate specific command (e.g., `delete_file('path_to_item')`, `rename_file(...)`).
+    4.  **Example - 'Delete all .log files in vm/logs/':**
+        *   Your first command should be: `list_directory_contents(target_path="logs", recursive=True)`
+        *   After receiving the output (e.g., "./app.log\n./trace.log\n./sub_log_dir/\n./sub_log_dir/another.log"), analyze this list. Your next commands would be:
+            `delete_file('logs/app.log')`
+            `delete_file('logs/trace.log')`
+            `delete_file('logs/sub_log_dir/another.log')`
+            (Note: Ensure paths for `delete_file` are correctly constructed based on the output of `list_directory_contents` and `delete_file`'s expectation of paths relative to `vm/`.)
+    5.  **Avoid Wildcards in Action Commands:** Do not use wildcard characters (like `*` or `?`) directly within commands like `delete_file('*.txt')`. Use the listing command to find specific files, then act on them individually.
 
 **INTERACTION FLOW:**
 1. Implement user requests through commands with highest quality standards
@@ -405,22 +426,66 @@ Your task in a re-planning scenario is to deeply analyze this feedback and the o
             *   Specific exit codes from `run_command` (e.g., 9009 on Windows, 127 on Linux/macOS for command not found).
             *   Permission errors (e.g., "Permission denied") related to file system access for tools/interpreters.
         *   **If an Environmental Error is Primary**:
-            *   Task `PersonaAgent` to handle it.
-            *   The instruction to `PersonaAgent` should:
-                1.  Clearly explain the environmental nature of the error (e.g., "The command `python3 vm/script.py` failed because 'python3' was not found.").
-                2.  State that `MainCoder` cannot fix this by editing application code.
-                3.  Suggest user-side actions (e.g., "Please ensure Python 3 is installed and in your system's PATH," or "Verify the tool you're trying to use is installed and accessible.").
-                4.  Optionally, ask if the user wants `MainCoder` to try a different command or path if relevant (e.g., "Would you like me to try running it with `python` instead?").
-            *   Example for `PersonaAgent` explaining an environmental error:
-              ```json
-              [
-                {
-                  "agent_name": "PersonaAgent",
-                  "instruction": "The user asked to 'fix errors'. The most recent significant error appears to be environmental: The command `python3 vm/snake_game.py` failed with 'python3 not found'. Please explain to the user that this means Python 3 is likely not installed or not in the system PATH, that MainCoder cannot fix this by editing code, and suggest they check their Python installation. Ask if they'd like to try running the script with just 'python' or provide a different command.",
-                  "is_final_step": true
-                }
-              ]
-              ```
+            *   **`ls`/`dir` Command Not Found Specific Fallback**:
+                *   If the environmental error from `run_command` is specifically a 'command not found' (or equivalent, e.g., exit code 127 on Linux, 9009 on Windows, or stderr explicitly saying "not found" or "not recognized") for an `ls` command (or its variants like `ls -R`, `ls -l`, etc.):
+                    1.  Your primary replan action **MUST** be to create a new step for `MainCoder`.
+                    2.  Instruct `MainCoder` to attempt the `dir` command as a fallback. For example: `run_command('dir /b .')` for a simple listing or `run_command('dir /b /s .')` if a recursive listing was originally intended. Remind MainCoder that the CWD for `run_command` is `vm/`.
+                    3.  This step should clearly indicate it's a fallback attempt due to `ls` failing.
+                    Example for `MainCoder` fallback to `dir`:
+                    ```json
+                    [
+                      {
+                        "agent_name": "MainCoder",
+                        "instruction": "The previous attempt to list files using `ls` failed (command not found). As a fallback, please attempt to list the contents of `vm/` using the `dir` command. For example, `run_command('dir /b .')`. If the original request implied a recursive listing, use `run_command('dir /b /s .')`.",
+                        "is_final_step": true
+                      }
+                    ]
+                    ```
+                *   If the environmental error from `run_command` is specifically a 'command not found' (or equivalent) for a `dir` command (or its variants):
+                    1.  Your primary replan action **MUST** be to create a new step for `MainCoder`.
+                    2.  Instruct `MainCoder` to attempt the `ls` command as a fallback. For example: `run_command('ls -A .')` for a simple listing or `run_command('ls -AR .')` if a recursive listing was originally intended. Remind MainCoder CWD is `vm/`.
+                    3.  This step should clearly indicate it's a fallback attempt due to `dir` failing.
+                    Example for `MainCoder` fallback to `ls`:
+                    ```json
+                    [
+                      {
+                        "agent_name": "MainCoder",
+                        "instruction": "The previous attempt to list files using `dir` failed (command not found). As a fallback, please attempt to list the contents of `vm/` using the `ls` command. For example, `run_command('ls -A .')`. If the original request implied a recursive listing, use `run_command('ls -AR .')`.",
+                        "is_final_step": true
+                      }
+                    ]
+                    ```
+            *   **General Environmental Errors or Exhausted Fallbacks (Route to PersonaAgent)**:
+                Only if:
+                    a) The fallback command (`dir` after `ls`, or `ls` after `dir`) also fails with a 'command not found', OR
+                    b) The environmental error is of a different nature (e.g., permissions errors for any command, other commands failing for non-code reasons, or `ls`/`dir` failing for reasons other than 'not found'), OR
+                    c) The agent has already exhausted these specific `ls`/`dir` fallbacks for the current logical task (e.g., trying to list files):
+                THEN, you should route to `PersonaAgent`.
+                *   The instruction to `PersonaAgent` should:
+                    1.  Clearly explain the persistent environmental nature of the error (e.g., "Both `ls` and `dir` commands failed to list files," or "The command `python3 vm/script.py` failed because 'python3' was not found.").
+                    2.  State that `MainCoder` cannot fix this by editing application code or by simple command fallbacks.
+                    3.  Suggest user-side actions (e.g., "Please ensure the necessary tools like `ls` or `dir` are available in your environment's PATH," or "Please ensure Python 3 is installed and in your system's PATH.").
+                    4.  Ask if the user can provide a known working command for the task, or if they want to try a different approach.
+                *   Example for `PersonaAgent` after `ls`/`dir` fallbacks failed:
+                  ```json
+                  [
+                    {
+                      "agent_name": "PersonaAgent",
+                      "instruction": "The user asked to 'fix errors' or a file listing was needed. Attempts to list files using both `ls` and `dir` commands failed (command not found). MainCoder cannot resolve this. Please explain to the user that neither common listing command is working and ask if they can provide a specific, known-working command for listing files in this environment, or suggest an alternative approach.",
+                      "is_final_step": true
+                    }
+                  ]
+                  ```
+                *   Example for `PersonaAgent` for other environmental errors (e.g., python not found):
+                  ```json
+                  [
+                    {
+                      "agent_name": "PersonaAgent",
+                      "instruction": "The user asked to 'fix errors'. The most recent significant error appears to be environmental: The command `python3 vm/snake_game.py` failed because 'python3' was not found (or a similar critical tool is missing/misconfigured). MainCoder cannot fix this by editing code. Please explain this to the user, suggest they check their Python (or relevant tool) installation and PATH. Ask if they'd like MainCoder to try a different command or if they have guidance.",
+                      "is_final_step": true
+                    }
+                  ]
+                  ```
         *   **Code Error (Actionable for MainCoder)**: If the error is clearly a code error within a user-generated script (e.g., Python `SyntaxError`, `NameError`, `TypeError` with a filename and line number from the log; or a `write_to_file` content formatting error):
             *   Task `MainCoder` to fix it.
             *   The instruction should be precise: Refer to the specific error from the log, the file involved (e.g., 'script.py'), the line number if available, and the type of error.
@@ -505,6 +570,30 @@ Your task in a re-planning scenario is to deeply analyze this feedback and the o
 *   **VALID JSON ONLY:** Your entire output must be a single, valid JSON list. Do not include any text outside of this JSON structure.
 *   **`is_final_step` ACCURACY:** Ensure `is_final_step` is `true` for the last dictionary in the list and `false` for all others. A plan must have exactly one `is_final_step: true`.
 *   **APPROPRIATE AGENT:** Always select the most suitable agent for the task described in the instruction.
+*   **CRITICAL RULE for MainCoder Tasking:**
+    When creating instructions for the `MainCoder` agent:
+    1.  You **MUST** formulate the task in terms of the explicitly defined commands available to `MainCoder`. These are:
+        *   `create_file(path, content)`
+        *   `write_to_file(path, content)`
+        *   `delete_file(path)` (Note: this now moves items to a trash folder)
+        *   `rename_file(old_path, new_path)`
+        *   `run_command(command)`
+        *   `generate_image(path, prompt)`
+        *   `set_user_preference(key, value)`
+        *   `get_user_preference(key)`
+        *   `list_directory_contents(target_path=".", recursive=True)`
+    2.  Do **NOT** invent new commands or assume `MainCoder` can execute arbitrary high-level functions like `delete_all_files(...)`.
+    3.  For complex operations or operations on multiple unspecified items (e.g., 'delete all files in a folder', 'rename all images matching a pattern', 'process all log files'), you **MUST** create a multi-step plan. A common pattern is 'List-Then-Act':
+        *   **Step 1 (Discovery/Listing):** Instruct `MainCoder` to use an appropriate command (preferably `list_directory_contents(...)`) to identify all target items. This step **MUST** have `is_final_step: false`.
+        *   **Step 2+ (Action):** Instruct `MainCoder` to analyze the output from the discovery step and then apply the required command(s) (e.g., `delete_file`, `rename_file`) to each relevant item individually. The final such action step will have `is_final_step: true`.
+        *   **Do NOT assume a task like 'delete all files' is complete after only listing the files.** The subsequent action steps are crucial.
+        *   **Example for "Delete all .txt files in vm/test_data/":**
+            *   Step 1 (MainCoder): Instruction: "Use `list_directory_contents(target_path="test_data", recursive=True)` to list all files and directories in the `vm/test_data/` directory." (is_final_step: false)
+            *   Step 2 (MainCoder): Instruction: "From the list of items obtained in the previous step (e.g., './file1.txt', './subdir/', './subdir/another.txt'), identify all paths that represent files ending with '.txt'. For each such .txt file, issue a `delete_file('test_data/path_to_file.txt')` command. Construct the path for `delete_file` by prepending the original `target_path` ('test_data/') to the file paths from the list (e.g., if list gives './file1.txt', command is `delete_file('test_data/file1.txt')`; if list gives './subdir/another.txt', command is `delete_file('test_data/subdir/another.txt')`)." (is_final_step: true)
+        *   **Example for "Create a project structure":**
+            *   Step 1 (MainCoder): Instruction: "Create a directory named 'src'. You can attempt this with `create_file('src/', '')` if your `create_file` can create directories when content is empty and path ends with '/', otherwise use `run_command('mkdir vm/src')`. Then create an empty file `main.py` inside 'src' using `create_file('src/main.py', '# Main application file')`." (is_final_step: false)
+            *   Step 2 (MainCoder): Instruction: "Create another directory named 'docs'. Use `run_command('mkdir vm/docs')`. Then create an empty file `readme.md` inside 'docs' using `create_file('docs/readme.md', '# Project Documentation')`." (is_final_step: true)
+    4.  **`run_command` CWD Context:** When instructing `MainCoder` to use the `run_command(command)` primitive, remember that the `command` itself will be executed with the `vm/` directory as its current working directory. Therefore, instruct `MainCoder` to use paths relative to `vm/` within the command string. For example, if the goal is to list all files in `vm/`, the instruction to `MainCoder` should be to execute `run_command('dir /b')` (Windows) or `run_command('ls -A .')` (POSIX), not `run_command('dir vm/')` or `run_command('ls vm/')`.
 
 Analyze the user's request below and generate the JSON plan.
 
@@ -663,6 +752,7 @@ class EnhancedMultiAgentSystem:
             "rename_file": self._rename_file,
             "set_user_preference": self._set_user_preference,
             "get_user_preference": self._get_user_preference,
+            "list_directory_contents": self._list_directory_contents, # New entry
         }
 
     def load_user_preferences(self):
@@ -1799,18 +1889,32 @@ Please analyze visual elements, provide design guidance, and suggest improvement
                 source_path = Path(img_path_str)
                 if not source_path.is_absolute() and not str(source_path).startswith(str(VM_DIR)):
                     source_path = VM_DIR / source_path.name
-                dest_path = trash_dir / source_path.name
+                # dest_path = trash_dir / source_path.name # Potential overwrite here
+                dest_name_in_trash = source_path.name # Original name for the item in trash
+                destination_in_trash = trash_dir / dest_name_in_trash
 
-                if source_path.exists() and source_path.is_file():
+                if source_path.exists() and source_path.is_file(): # Still only process files
                     try:
-                        shutil.move(str(source_path), str(dest_path))
-                        messages.append(f"🗑️ Moved '{source_path.name}' to '{TRASH_DIR_NAME}/'.")
+                        # To prevent overwriting in trash, append a timestamp if it already exists
+                        counter = 0
+                        original_destination_name = destination_in_trash.name
+                        while destination_in_trash.exists(): # Check existence of the full path
+                            counter += 1
+                            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                            name_body = Path(original_destination_name).stem
+                            suffix = Path(original_destination_name).suffix
+                            # For _move_to_trash, items are expected to be files
+                            new_name = f"{name_body}.{timestamp}_{counter}{suffix}"
+                            destination_in_trash = trash_dir / new_name
+
+                        shutil.move(str(source_path), str(destination_in_trash))
+                        messages.append(f"🗑️ Moved '{source_path.name}' to '{TRASH_DIR_NAME}/' (as '{destination_in_trash.name}').")
                     except Exception as e:
                         messages.append(f"❌ Error moving '{source_path.name}' to trash: {e}")
                 elif not source_path.exists():
                     messages.append(f"ℹ️ File not found, cannot trash: '{img_path_str}' (expected at {source_path}).")
-                elif not source_path.is_file():
-                    messages.append(f"ℹ️ Path is not a file, cannot trash: '{img_path_str}'.")
+                elif not source_path.is_file(): # Explicitly state if it's not a file (e.g. a dir)
+                    messages.append(f"ℹ️ Path is not a file, cannot trash with _move_to_trash: '{img_path_str}'.")
             except Exception as e:
                 messages.append(f"❌ Unexpected error processing path '{img_path_str}' for trashing: {e}")
         return messages
@@ -2385,6 +2489,61 @@ Focus on actionable improvements that leverage all three agent perspectives.
 
         return final_path
 
+    def _list_directory_contents(self, target_path_str: str = ".", recursive: bool = True):
+        """
+        Lists files and directories within the specified target_path_str, relative to VM_DIR.
+        Paths in the output are relative to the resolved target_path_str.
+        Example: if target_path_str is "subdir" (which resolves to vm/subdir),
+                 and vm/subdir contains file.txt, output will include "./file.txt".
+                 If recursive and vm/subdir/nested/data.bin exists, output includes "./nested/data.bin".
+        """
+        # target_path_str is like ".", "subfolder", or "subfolder/another"
+        # _safe_path will return Path('vm') or Path('vm/subfolder') etc.
+        resolved_scan_base_path = self._safe_path(target_path_str)
+
+        if not resolved_scan_base_path or not resolved_scan_base_path.exists():
+            return f"❌ Error: Path not found or invalid after resolving: {target_path_str} (became {resolved_scan_base_path})"
+        if not resolved_scan_base_path.is_dir():
+            return f"❌ Error: Path is not a directory: {target_path_str} (became {resolved_scan_base_path})"
+
+        output_items = []
+        try:
+            if recursive:
+                for root_str, dirs, files in os.walk(str(resolved_scan_base_path), topdown=True):
+                    # Sort dirs and files for consistent order
+                    dirs.sort()
+                    files.sort()
+
+                    root_path = Path(root_str)
+                    # Path relative to the directory we started scanning from
+                    path_relative_to_scan_base = root_path.relative_to(resolved_scan_base_path)
+
+                    for name in files:
+                        # Construct path like ./file.txt or ./sub/file.txt
+                        # Path(".") is used to ensure it starts with ./ if path_relative_to_scan_base is empty (i.e., root is scan_base)
+                        item_display_path = Path(".") / path_relative_to_scan_base / name
+                        output_items.append(item_display_path.as_posix())
+                    for name in dirs:
+                        item_display_path = Path(".") / path_relative_to_scan_base / name
+                        output_items.append(item_display_path.as_posix() + "/")
+            else: # Not recursive, list immediate contents of resolved_scan_base_path
+                for item_name in sorted(os.listdir(str(resolved_scan_base_path))):
+                    # Here, item_name is directly inside resolved_scan_base_path
+                    # So, the path relative to scan base is just item_name, prefixed with ./
+                    item_display_path = Path(".") / item_name
+                    if (resolved_scan_base_path / item_name).is_dir():
+                        output_items.append(item_display_path.as_posix() + "/")
+                    else: # Assume file if not a directory
+                        output_items.append(item_display_path.as_posix())
+
+        except Exception as e:
+            return f"❌ Error listing directory contents for '{target_path_str}': {e}"
+
+        if not output_items:
+            return f"ℹ️ No items found in '{target_path_str}' (resolved to {resolved_scan_base_path})."
+
+        return "\n".join(output_items) # Use escaped newline for the agent's processing, it will parse this.
+
     def _create_file(self, path, content=""):
         """Create new file with enhanced error handling"""
         filepath = self._safe_path(path)
@@ -2416,21 +2575,53 @@ Focus on actionable improvements that leverage all three agent perspectives.
             self.error_context.append(error_msg)
             return error_msg
 
-    def _delete_file(self, path):
-        """Delete file with enhanced feedback"""
-        filepath = self._safe_path(path)
-        if not filepath or not filepath.exists():
-            return f"❌ File not found: {path}"
+    def _delete_file(self, path_str: str): # path_str is the original path string from the agent
+        """Moves a file or directory to the .trash directory within VM_DIR."""
+        filepath_to_trash = self._safe_path(path_str) # filepath_to_trash is Path('vm/item_to_delete')
+
+        if not filepath_to_trash or not filepath_to_trash.exists():
+            return f"❌ Item not found: {path_str}"
+
+        trash_dir = VM_DIR / TRASH_DIR_NAME # TRASH_DIR_NAME is already defined as ".trash"
+
         try:
-            if filepath.is_dir():
-                shutil.rmtree(filepath)
-                return f"✅ Deleted directory: {path}"
-            else:
-                file_size = filepath.stat().st_size
-                filepath.unlink()
-                return f"✅ Deleted file: {path} ({file_size} bytes)"
+            trash_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            error_msg = f"❌ Error deleting {path}: {e}"
+            error_msg = f"❌ Error creating trash directory {trash_dir}: {e}"
+            self.error_context.append(error_msg)
+            return error_msg
+
+        destination_in_trash = trash_dir / filepath_to_trash.name # e.g., vm/.trash/item_to_delete
+
+        try:
+            # To prevent overwriting in trash, append a timestamp if it already exists
+            counter = 0
+            original_destination_name = destination_in_trash.name
+            while destination_in_trash.exists():
+                counter += 1
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                # For files: name_body.timestamp_counter.suffix
+                # For dirs: dirname.timestamp_counter
+                name_body = Path(original_destination_name).stem
+                suffix = Path(original_destination_name).suffix
+                if filepath_to_trash.is_dir(): # Check type *before* move
+                     new_name = f"{original_destination_name}.{timestamp}_{counter}"
+                else: # is_file
+                     new_name = f"{name_body}.{timestamp}_{counter}{suffix}"
+                destination_in_trash = trash_dir / new_name
+
+            item_type_original = "directory" if filepath_to_trash.is_dir() else "file"
+
+            shutil.move(str(filepath_to_trash), str(destination_in_trash))
+
+            # Get size before moving, if it was a file
+            size_str = ""
+            # Size info is less critical for a "moved to trash" message, so omitting complex statting.
+
+            return f"🗑️ Moved {item_type_original} to trash: {path_str} (as {destination_in_trash.name}) {size_str}".strip()
+
+        except Exception as e:
+            error_msg = f"❌ Error moving {path_str} to trash: {e}"
             self.error_context.append(error_msg)
             return error_msg
 
@@ -2480,11 +2671,14 @@ Focus on actionable improvements that leverage all three agent perspectives.
                 "status": "REPLAN_REQUESTED",
                 "reason": error_reason
             }
-        except Exception as e: # For other exceptions, return the string error message as before
-            error_msg = f"❌ Command execution error for '{command}': {e}"
-            self._log_to_memory("COMMAND_ERROR", error_msg, priority=1)
-            self.error_context.append(error_msg)
-            return error_msg
+        except Exception as e:
+            error_reason = f"Command execution error for '{command}': {e}" # Retain the original error detail
+            self._log_to_memory("COMMAND_ERROR", error_reason, priority=1)
+            self.error_context.append(f"Command failed: {error_reason}") # Consistent with other error appends
+            return {
+                "status": "REPLAN_REQUESTED",
+                "reason": error_reason
+            }
 
     def generate_image(self, path, prompt):
         """Enhanced image generation with better feedback"""
