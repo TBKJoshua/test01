@@ -589,7 +589,7 @@ Your task in a re-planning scenario is to deeply analyze this feedback and the o
         *   **Do NOT assume a task like 'delete all files' is complete after only listing the files.** The subsequent action steps are crucial.
         *   **Example for "Delete all .txt files in vm/test_data/":**
             *   Step 1 (MainCoder): Instruction: "Use `list_directory_contents(target_path="test_data", recursive=True)` to list all files and directories in the `vm/test_data/` directory." (is_final_step: false)
-            *   Step 2 (MainCoder): Instruction: "From the list of items obtained in the previous step (e.g., './file1.txt', './subdir/', './subdir/another.txt'), identify all paths that represent files ending with '.txt'. For each such .txt file, issue a `delete_file('test_data/path_to_file.txt')` command. Construct the path for `delete_file` by prepending the original `target_path` ('test_data/') to the file paths from the list (e.g., if list gives './file1.txt', command is `delete_file('test_data/file1.txt')`; if list gives './subdir/another.txt', command is `delete_file('test_data/subdir/another.txt')`)." (is_final_step: true)
+            *   Step 2 (MainCoder): Instruction: "From the list of items obtained in the previous step (this list will be directly provided in MainCoder's context, e.g., './file1.txt', './subdir/', './subdir/another.txt'), identify all paths that represent files ending with '.txt'. For each such .txt file, issue a `delete_file('test_data/path_to_file.txt')` command. Construct the path for `delete_file` by prepending the original `target_path` ('test_data/') to the file paths from the list (e.g., if list gives './file1.txt', command is `delete_file('test_data/file1.txt')`; if list gives './subdir/another.txt', command is `delete_file('test_data/subdir/another.txt')`)." (is_final_step: true)
         *   **Example for "Create a project structure":**
             *   Step 1 (MainCoder): Instruction: "Create a directory named 'src'. You can attempt this with `create_file('src/', '')` if your `create_file` can create directories when content is empty and path ends with '/', otherwise use `run_command('mkdir vm/src')`. Then create an empty file `main.py` inside 'src' using `create_file('src/main.py', '# Main application file')`." (is_final_step: false)
             *   Step 2 (MainCoder): Instruction: "Create another directory named 'docs'. Use `run_command('mkdir vm/docs')`. Then create an empty file `readme.md` inside 'docs' using `create_file('docs/readme.md', '# Project Documentation')`." (is_final_step: true)
@@ -1140,7 +1140,7 @@ class EnhancedMultiAgentSystem:
 
         return full_proactive_art_advice
 
-    def _execute_main_coder_phase(self, coder_instruction: str, art_guidance: str | None):
+    def _execute_main_coder_phase(self, coder_instruction: str, art_guidance: str | None, previous_step_direct_output: str | None = None):
         """
         Executes the main coder's implementation phase.
         Accepts coder_instruction (from planner) and optional art_guidance.
@@ -1152,7 +1152,8 @@ class EnhancedMultiAgentSystem:
         main_prompt_parts = self._build_enhanced_prompt(
             user_prompt=coder_instruction,
             system_prompt=MAIN_AGENT_PROMPT,
-            proactive_art_advice=art_guidance
+            proactive_art_advice=art_guidance,
+            previous_step_direct_output=previous_step_direct_output
         )
 
         main_response_stream = self.client.models.generate_content_stream(
@@ -1556,7 +1557,13 @@ class EnhancedMultiAgentSystem:
 
         yield {"type": "system", "content": f"📜 Planner generated {len(plan_steps)} steps. Starting execution..."}
         
+        # previous_step_output will hold the full output data from the PREVIOUSLY COMPLETED step (i-1).
+        # It's used to extract string data for the current step if needed.
         previous_step_output = None
+        # output_from_completed_step_for_maincoder holds the extracted string from previous_step_output,
+        # ready to be passed to the CURRENT MainCoder step.
+        output_from_completed_step_for_maincoder: str | None = None
+
         i = 0 # Initialize loop counter
 
         # Loop control variables for final message
@@ -1593,9 +1600,13 @@ class EnhancedMultiAgentSystem:
             if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                 yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "active"}
 
-            replan_requested_this_step = False # Renamed to avoid conflict with outer scope if any
+            replan_requested_this_step = False
 
             try:
+                # Determine the direct string input for the current step based on the PREVIOUS step's output
+                input_for_current_step_from_previous = output_from_completed_step_for_maincoder
+                # output_from_completed_step_for_maincoder = None # Reset for the output of THIS step. This will be set at the end of the try block.
+
                 if agent_name_from_plan == "PlannerAgent":
                     yield {"type": "agent", "agent": "✨ Assistant", "content": instruction}
                     self._log_interaction("planner_direct_response", instruction)
@@ -1604,14 +1615,11 @@ class EnhancedMultiAgentSystem:
                 elif agent_name_from_plan == "PromptEnhancer":
                     if not self.prompt_enhancer_enabled:
                         yield {"type": "system", "content": "ℹ️ Skipping planned PromptEnhancer step as it's globally disabled. Using input as output."}
-                        # previous_step_output = instruction # This was incorrect, should be step_output_data
-                        step_output_data = instruction
+                        step_output_data = instruction # Pass instruction through
                         self._log_interaction("skipped_prompt_enhancer_step", f"Instruction for disabled enhancer: {instruction}")
                     else:
                         text_to_enhance = instruction
-                        # previous_step_output = yield from self._handle_prompt_enhancement(text_to_enhance) # This was incorrect
                         step_output_data = yield from self._handle_prompt_enhancement(text_to_enhance)
-                    # step_output_data = previous_step_output # This was redundant/incorrect
 
                 elif agent_name_from_plan == "ProactiveArtAgent":
                     step_output_data = yield from self._handle_proactive_art_guidance(instruction)
@@ -1628,13 +1636,17 @@ class EnhancedMultiAgentSystem:
 
                 elif agent_name_from_plan == "MainCoder":
                     art_guidance_for_coder = None
-                    if isinstance(previous_step_output, str) and \
-                       ("artistic guidance" in previous_step_output.lower() or \
-                        "art style" in previous_step_output.lower() or \
-                        "mood and tone" in previous_step_output.lower()):
-                        art_guidance_for_coder = previous_step_output
+                    # Check if the previous step's output (now in previous_step_output, which is step_output_data from i-1)
+                    # was a string suitable for art guidance.
+                    # Note: input_for_current_step_from_previous is the string extracted from previous_step_output.
+                    if isinstance(input_for_current_step_from_previous, str) and \
+                       ("artistic guidance" in input_for_current_step_from_previous.lower() or \
+                        "art style" in input_for_current_step_from_previous.lower() or \
+                        "mood and tone" in input_for_current_step_from_previous.lower()):
+                        art_guidance_for_coder = input_for_current_step_from_previous
 
                     current_instruction_for_coder = instruction
+                    # Check if previous_step_output (the full data from previous step) was a list of art critiques
                     if isinstance(previous_step_output, list) and previous_step_output and \
                        isinstance(previous_step_output[0], dict) and "critique_text" in previous_step_output[0] and \
                        "{ART_CRITIC_FEEDBACK_PLACEHOLDER}" in current_instruction_for_coder:
@@ -1646,19 +1658,18 @@ class EnhancedMultiAgentSystem:
                             current_instruction_for_coder = current_instruction_for_coder.replace("{ART_CRITIC_FEEDBACK_PLACEHOLDER}", critique_text_to_inject.strip())
                             yield {"type": "system", "content": "📝 Injected ArtCritic feedback into MainCoder instruction for refinement."}
 
-                    # Manually drive _execute_main_coder_phase to capture its return value
-                    # while still yielding its UI messages.
                     main_coder_phase_generator = self._execute_main_coder_phase(
                         coder_instruction=current_instruction_for_coder,
-                        art_guidance=art_guidance_for_coder
+                        art_guidance=art_guidance_for_coder,
+                        previous_step_direct_output=input_for_current_step_from_previous
                     )
                     returned_main_coder_data = None
                     try:
                         while True:
-                            ui_message = next(main_coder_phase_generator) # Get yielded UI messages
-                            yield ui_message # Pass them up to the UI processing loop
+                            ui_message = next(main_coder_phase_generator)
+                            yield ui_message
                     except StopIteration as e:
-                        returned_main_coder_data = e.value # This is the dict {text_response, implementation_results, ...}
+                        returned_main_coder_data = e.value
 
                     if returned_main_coder_data is None:
                         self.error_context.append("MainCoder phase failed to return data (returned None).")
@@ -1666,27 +1677,21 @@ class EnhancedMultiAgentSystem:
                     else:
                         step_output_data = returned_main_coder_data
 
-
-                    # Check for REQUEST_REPLAN from command execution first (now using step_output_data)
                     if isinstance(step_output_data, dict) and step_output_data.get("implementation_results"):
                         for item_result in step_output_data.get("implementation_results", []):
                             if isinstance(item_result, str) and item_result.startswith("REQUEST_REPLAN:"):
                                 replan_requested_this_step = True
                                 replan_reason = item_result[len("REQUEST_REPLAN:"):].strip()
                                 yield {"type": "system", "content": f"ℹ️ Replan triggered by failed command. Reason: {replan_reason[:100]}..."}
-                                # Clean up text_response if the same signal is there to avoid duplicate processing by planner
                                 if "text_response" in step_output_data and step_output_data["text_response"].endswith(item_result):
                                     step_output_data["text_response"] = step_output_data["text_response"][:-len(item_result)].strip()
                                 break
-
-                    # Then, check for REQUEST_REPLAN from MainCoder's textual output (if not already caught)
                     if not replan_requested_this_step and isinstance(step_output_data, dict) and "text_response" in step_output_data:
                         response_text = step_output_data["text_response"]
                         lines = response_text.strip().splitlines()
                         if lines and lines[-1].startswith("REQUEST_REPLAN:"):
                             replan_requested_this_step = True
                             replan_reason = lines[-1][len("REQUEST_REPLAN:"):] .strip()
-                            # No need to yield here as the generic replan message will cover it later if this is the primary source
                             step_output_data["text_response"] = "\n".join(lines[:-1]).strip()
 
                 elif agent_name_from_plan == "CodeCritic":
@@ -1712,7 +1717,6 @@ class EnhancedMultiAgentSystem:
                     yield {"type": "error", "content": f"Unknown agent in plan: {agent_name_from_plan}. Skipping step."}
                     step_output_data = f"Error: Unknown agent {agent_name_from_plan}"
 
-                # --- Re-plan logic (now checked AFTER agent execution within the try block) ---
                 if replan_requested_this_step:
                     yield {"type": "system", "content": f"🤖 Agent {agent_name_from_plan} requested a re-plan. Reason: {replan_reason}. Initiating new planning cycle..."}
                     recent_changes_summary = "No recent changes logged."
@@ -1720,7 +1724,6 @@ class EnhancedMultiAgentSystem:
                         changes_to_log = self.project_context["recent_changes"][-5:]
                         formatted_changes = [f"- {ch['command']}: {str(ch['args'])[:100]}" for ch in changes_to_log]
                         if formatted_changes: recent_changes_summary = "\n".join(formatted_changes)
-
                     new_planner_prompt = (
                         f"RE-PLANNING REQUESTED. Original User Prompt: '{original_user_prompt}'.\n"
                         f"Reason for Re-plan by {agent_name_from_plan}: '{replan_reason}'.\n"
@@ -1728,32 +1731,40 @@ class EnhancedMultiAgentSystem:
                         f"Please formulate a new plan to achieve the original user prompt, taking this new context and reason into account. Avoid the previous pitfalls."
                     )
                     new_plan_steps = self._get_plan_from_planner(new_planner_prompt)
-
-                    if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]: # Deactivate current agent
+                    if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                         yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
-
                     if new_plan_steps:
                         yield {"type": "system", "content": f"📜 New plan received with {len(new_plan_steps)} steps. Restarting execution..."}
                         plan_steps = new_plan_steps
                         i = 0
                         previous_step_output = None
-                        completed_normally = False # Reset for new plan
+                        output_from_completed_step_for_maincoder = None # Reset for the new plan
+                        completed_normally = False
                         replan_failed_to_get_new_steps = False
-                        continue # Crucial: Jumps to the next iteration of `while i < len(plan_steps)` with i=0
+                        continue
                     else:
                         yield {"type": "error", "content": "Planner failed to generate a new plan after re-plan request. Stopping."}
                         replan_failed_to_get_new_steps = True
-                        break # Exit while loop
+                        break
 
-                # Normal step completion (no re-plan requested or re-plan failed to get new steps)
                 if agent_name_for_status not in ["unknown_agent", "planner_agent_direct", "persona_agent"]:
                     yield {"type": "agent_status_update", "agent": agent_name_for_status, "status": "inactive"}
 
                 previous_step_output = step_output_data
 
-                if is_final_step: # No `and not replan_requested_this_step` needed here as continue/break handles it
+                # Update output_from_completed_step_for_maincoder based on the *current* step's output
+                output_from_completed_step_for_maincoder = None # Reset before assigning for next iteration
+                if isinstance(previous_step_output, dict):
+                    if previous_step_output.get("type") == "system" and isinstance(previous_step_output.get("content"), str):
+                        output_from_completed_step_for_maincoder = previous_step_output.get("content")
+                    elif previous_step_output.get("type") == "agent" and previous_step_output.get("agent") == "✨ Assistant" and isinstance(previous_step_output.get("content"), str):
+                        output_from_completed_step_for_maincoder = previous_step_output.get("content")
+                elif isinstance(previous_step_output, str):
+                    output_from_completed_step_for_maincoder = previous_step_output
+
+                if is_final_step:
                      yield {"type": "system", "content": f"✅ Final step ({agent_name_from_plan}) completed."}
-                     completed_normally = True # Mark normal completion of the (potentially new) plan
+                     completed_normally = True
                      # Loop will terminate naturally if this was the last step
 
             except Exception as e:
@@ -1969,7 +1980,7 @@ Focus on actionable improvements that leverage all three agent perspectives.
             if "recent_changes" not in self.project_context:
                  self.project_context["recent_changes"] = []
 
-    def _build_enhanced_prompt(self, user_prompt, system_prompt, proactive_art_advice=None, current_plan_summary: str | None = None, project_files_summary: str | None = None, recent_changes_summary: str | None = None, error_log_summary: str | None = None, memory_context_str: str | None = None):
+    def _build_enhanced_prompt(self, user_prompt, system_prompt, proactive_art_advice=None, current_plan_summary: str | None = None, project_files_summary: str | None = None, recent_changes_summary: str | None = None, error_log_summary: str | None = None, memory_context_str: str | None = None, previous_step_direct_output: str | None = None):
         """Build enhanced prompt with comprehensive context"""
         current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1992,6 +2003,9 @@ Focus on actionable improvements that leverage all three agent perspectives.
 
         if memory_context_str:
             base_context_text += f"**RECENT MEMORIES (from memory.txt):**\n{memory_context_str}\n\n"
+
+        if previous_step_direct_output and isinstance(previous_step_direct_output, str) and previous_step_direct_output.strip():
+            base_context_text += f"**INPUT FROM PREVIOUS STEP (Use for current task):**\n{previous_step_direct_output}\n\n"
 
         base_context_text += "**PROJECT STATUS:**\n" # This will be followed by file listings etc.
 
