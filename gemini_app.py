@@ -17,13 +17,18 @@ from pathlib import Path
 # Third-party imports
 from PIL import Image, ImageTk
 
-# pip install google-genai Pillow
+# pip install google-genai Pillow Pygments
 try:
     from google import genai
     from google.genai import types
     GENAI_IMPORTED = True
 except ImportError:
     GENAI_IMPORTED = False
+
+from pygments import highlight
+from pygments.lexers import get_lexer_by_name, guess_lexer_for_filename
+from pygments.styles import get_style_by_name
+from pygments.util import ClassNotFound
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -2843,11 +2848,63 @@ class EnhancedGeminiIDE(tk.Tk):
         self._debounce_refresh_id = None
         self._debounce_insights_id = None
         self._save_timer = None
-        self._debounce_interval = 300
+        self._debounce_interval = 300 # Used for file refresh, insights, and auto-save
+        self._highlight_job = None # For Pygments debouncing
+        self._pygments_highlight_delay = 500 # milliseconds for Pygments debounce
 
         self._create_enhanced_menu()
         self._create_enhanced_layout()
         self._create_enhanced_status_bar()
+
+        # Pygments style setup
+        self.pygments_style = get_style_by_name('monokai')
+        for ttype, ndef in self.pygments_style:
+            tag_name = f"pyg_{str(ttype).replace('.', '_')}"
+            fg = ndef['color']
+            # Pygments colors are hex strings like "RRGGBB" or "RRGGBBAA" or "" for default
+            # Tkinter needs "#RRGGBB"
+            tkinter_fg = None
+            if fg:
+                tkinter_fg = f"#{fg}"
+
+            # For overall background, the editor's bg is set.
+            # For selection background, that's a separate Text widget property.
+            if tkinter_fg:
+                self.editor.tag_configure(tag_name, foreground=tkinter_fg)
+                # Handle bold and italic from style
+                # Ensure font configuration is robust
+                try:
+                    font_desc = self.editor.cget("font")
+                    if isinstance(font_desc, str): # tk.Text returns string font description
+                        font_parts = list(tk.font.Font(font=font_desc).actual().values())
+                        current_font_family = font_parts[0] if font_parts else "Consolas" # Default family
+                        current_font_size = int(font_parts[1]) if len(font_parts) > 1 and isinstance(font_parts[1], (int, float)) else 12 # Default size
+                        current_font_styles = font_parts[2:] if len(font_parts) > 2 else [] # existing styles like "bold", "italic"
+                    elif isinstance(font_desc, tuple): # If it's already a tuple
+                        current_font_family = font_desc[0]
+                        current_font_size = int(font_desc[1])
+                        current_font_styles = list(font_desc[2:]) if len(font_desc) > 2 else []
+                    else: # Fallback if font description is unexpected
+                        current_font_family = "Consolas"
+                        current_font_size = 12
+                        current_font_styles = []
+                except Exception: # Catch any error during font parsing
+                    current_font_family = "Consolas" # Fallback font
+                    current_font_size = 12
+                    current_font_styles = []
+
+                font_style_parts_new = list(current_font_styles) # Start with existing styles
+                if ndef['bold'] and "bold" not in font_style_parts_new:
+                    font_style_parts_new.append("bold")
+                if ndef['italic'] and "italic" not in font_style_parts_new:
+                    font_style_parts_new.append("italic")
+                # Underline not directly mapped here, but could be if ndef['underline']
+
+                if set(font_style_parts_new) != set(current_font_styles): # Only update font if new styles are added
+                    self.editor.tag_configure(tag_name, font=(current_font_family, current_font_size, " ".join(font_style_parts_new)))
+                elif tkinter_fg: # Ensure basic foreground is set even if no bold/italic changes
+                     self.editor.tag_configure(tag_name, foreground=tkinter_fg)
+
 
         api_key = load_api_key()
         if not api_key and GENAI_IMPORTED:
@@ -2989,7 +3046,7 @@ class EnhancedGeminiIDE(tk.Tk):
         right_frame = self._setup_right_panel(main_pane)
         self._setup_input_area(right_frame)
         self.editor.bind("<Control-s>", lambda e: self.save_current_file())
-        self._setup_enhanced_syntax_highlighting()
+        # self._setup_enhanced_syntax_highlighting() # REMOVED
         self.editor.bind("<KeyRelease>", self._on_editor_key_release)
         self._schedule_refresh_files()
 
@@ -3005,74 +3062,64 @@ class EnhancedGeminiIDE(tk.Tk):
             self.after_cancel(self._debounce_insights_id)
         self._debounce_insights_id = self.after(self._debounce_interval, self.update_agent_insights)
 
-    def _setup_enhanced_syntax_highlighting(self):
-        """Enhanced syntax highlighting"""
-        self.editor.tag_configure("keyword", foreground="#569cd6")
-        self.editor.tag_configure("string", foreground="#ce9178")
-        self.editor.tag_configure("comment", foreground="#6a9955")
-        self.editor.tag_configure("number", foreground="#b5cea8")
-        self.editor.tag_configure("function", foreground="#dcdcaa")
-        self.editor.tag_configure("class", foreground="#4ec9b0")
-        self.editor.tag_configure("operator", foreground="#d4d4d4")
-        raw_patterns = {
-            "keyword": r"\b(def|class|import|from|for|while|if|elif|else|return|in|and|or|not|is|with|as|try|except|finally|raise|yield|pass|continue|break|global|nonlocal|lambda|assert|async|await)\b",
-            "string": r"(\".*?\"|\'.*?\'|\"\"\".*?\"\"\"|\'\'\'.*?\'\'\')",
-            "comment": r"#.*",
-            "number": r"\b\d+(\.\d*)?\b",
-            "function": r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?=\()",
-            "class": r"\bclass\s+([a-zA-Z_][a-zA-Z0-9_]*)",
-            "operator": r"[+\-*/=<>!&|^~%]"
-        }
-        self.compiled_syntax_patterns = {
-            tag: re.compile(pattern, re.MULTILINE | re.DOTALL)
-            for tag, pattern in raw_patterns.items()
-        }
+    def _schedule_pygments_highlighting(self, event=None):
+        if self._highlight_job:
+            self.after_cancel(self._highlight_job)
+        self._highlight_job = self.after(self._pygments_highlight_delay, self._apply_pygments_to_current_editor)
 
-    def _apply_full_syntax_highlighting(self):
-        """Apply full syntax highlighting to the entire document."""
-        content = self.editor.get("1.0", tk.END)
-        for tag in self.compiled_syntax_patterns.keys():
-            self.editor.tag_remove(tag, "1.0", tk.END)
-        for tag, compiled_pattern in self.compiled_syntax_patterns.items():
-            for match in compiled_pattern.finditer(content):
-                start, end = match.span()
-                self.editor.tag_add(tag, f"1.0+{start}c", f"1.0+{end}c")
+    def _apply_pygments_to_current_editor(self):
+        if not self.current_open_file_path: # Or if editor is empty
+            return
 
-    def _apply_optimized_syntax_highlighting(self, event=None):
-        """Apply syntax highlighting only to a range of lines around the edit."""
+        content = self.editor.get("1.0", tk.END + "-1c") # Exclude final newline
+        if not content.strip(): # No content to highlight
+            # Clear existing tags if any
+            for tag in self.editor.tag_names():
+                if tag.startswith("pyg_"):
+                    self.editor.tag_remove(tag, "1.0", tk.END)
+            return
+
         try:
-            current_pos = self.editor.index(tk.INSERT)
-            current_line = int(current_pos.split('.')[0])
-            start_line = max(1, current_line - 5)
-            last_doc_line_str = self.editor.index(f"{tk.END}-1c").split('.')[0]
-            last_doc_line = int(last_doc_line_str) if last_doc_line_str.isdigit() else 1
-            end_line = min(last_doc_line, current_line + 5)
-            if start_line > end_line:
-                start_line = end_line
-            start_index = f"{start_line}.0"
-            end_index = f"{end_line}.end"
-            content_to_highlight = self.editor.get(start_index, end_index)
-            if not content_to_highlight:
-                return
-            for tag_key in self.compiled_syntax_patterns.keys():
-                self.editor.tag_remove(tag_key, start_index, end_index)
-            for tag_key, compiled_pattern in self.compiled_syntax_patterns.items():
-                for match in compiled_pattern.finditer(content_to_highlight):
-                    match_start_offset, match_end_offset = match.span()
-                    abs_match_start = self.editor.index(f"{start_index} + {match_start_offset} chars")
-                    abs_match_end = self.editor.index(f"{start_index} + {match_end_offset} chars")
-                    self.editor.tag_add(tag_key, abs_match_start, abs_match_end)
-        except Exception:
-            self._apply_full_syntax_highlighting()
-            pass
+            # Use content for lexer guessing if file is new or path is uncertain
+            lexer = guess_lexer_for_filename(str(self.current_open_file_path), content, stripall=False)
+        except ClassNotFound:
+            lexer = get_lexer_by_name("text")
+        except Exception: # Catch any other lexer guessing error
+            lexer = get_lexer_by_name("text")
 
-    def _on_editor_key_release(self, event=None):
-        """Enhanced editor key release handler"""
-        self._apply_optimized_syntax_highlighting()
+        # Clear existing Pygments tags before re-applying
+        for tag in self.editor.tag_names():
+            if tag.startswith("pyg_"):
+                self.editor.tag_remove(tag, "1.0", tk.END)
+
+        self.editor.mark_set("range_start", "1.0")
+        # Check if lexer has get_tokens_unprocessed, otherwise skip (e.g. for 'text' lexer if it's minimal)
+        if hasattr(lexer, 'get_tokens_unprocessed'):
+            tokens = lexer.get_tokens_unprocessed(content)
+            for ttype, value in tokens:
+                tag_name = f"pyg_{str(ttype).replace('.', '_')}"
+                self.editor.mark_set("range_end", f"range_start + {len(value)}c")
+                if tag_name in self.editor.tag_names(): # Apply if tag was configured from style
+                    self.editor.tag_add(tag_name, "range_start", "range_end")
+                self.editor.mark_set("range_start", "range_end")
+
+        # Auto-save logic is now triggered after highlighting completes
         if self._save_timer:
             self.after_cancel(self._save_timer)
             self._save_timer = None
         self._save_timer = self.after(2000, self._auto_save)
+
+
+    def _on_editor_key_release(self, event=None):
+        """Enhanced editor key release handler"""
+        # self._apply_optimized_syntax_highlighting() # REMOVED
+        self._schedule_pygments_highlighting() # ADDED
+        # The auto-save logic is now part of _apply_pygments_to_current_editor
+        # if self._save_timer:
+        #     self.after_cancel(self._save_timer)
+        #     self._save_timer = None
+        # self._save_timer = self.after(2000, self._auto_save)
+
 
     def _auto_save(self):
         """Auto-save current file if one is open."""
@@ -3549,7 +3596,31 @@ class EnhancedGeminiIDE(tk.Tk):
             self.editor.config(state="normal")
             self.editor.delete("1.0", tk.END)
             self.editor.insert("1.0", content)
-            self.after(50, self._apply_full_syntax_highlighting)
+            # self.after(50, self._apply_full_syntax_highlighting) # REMOVED
+
+            # Add Pygments highlighting
+            try:
+                # guess_lexer_for_filename can take content as an argument too
+                lexer = guess_lexer_for_filename(str(path), content, stripall=False)
+            except ClassNotFound:
+                lexer = get_lexer_by_name("text") # Fallback to plain text
+            except Exception: # Catch other potential errors during lexer guessing
+                lexer = get_lexer_by_name("text")
+
+            self.editor.mark_set("range_start", "1.0")
+            # Clear existing Pygments tags before re-applying to avoid layering issues
+            for tag in self.editor.tag_names():
+                if tag.startswith("pyg_"):
+                    self.editor.tag_remove(tag, "1.0", tk.END)
+
+            for ttype, value in lexer.get_tokens_unprocessed(content):
+                tag_name = f"pyg_{str(ttype).replace('.', '_')}"
+                self.editor.mark_set("range_end", f"range_start + {len(value)}c")
+                # Check if tag exists (was configured from style)
+                if tag_name in self.editor.tag_names():
+                    self.editor.tag_add(tag_name, "range_start", "range_end")
+                self.editor.mark_set("range_start", "range_end")
+
             self.notebook.select(0)
             line_count = len(content.splitlines())
             char_count = len(content)
